@@ -170,7 +170,7 @@ echo "  3) Setup: Arch Linux            (Advanced - Terminal Only)"
 echo -e "  ${RED}4) Uninstall: Remove PXE Server & Clean Up${NC}"
 echo ""
 while true; do
-    read -p "Enter choice [1-4]: " OS_CHOICE
+    read -p "Enter choice [1-4]: " OS_CHOICE </dev/tty
     case $OS_CHOICE in
         1|2|3|4) break ;;
         *) echo -e "${RED}Invalid. Please enter 1, 2, 3, or 4.${NC}" ;;
@@ -185,7 +185,7 @@ if [ "$OS_CHOICE" == "4" ]; then
     echo -e "${RED}║  WARNING: This will completely remove the PXE       ║${NC}"
     echo -e "${RED}║  server, all downloaded ISOs, and related packages. ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════╝${NC}"
-    read -p "Type 'YES' in capitals to confirm: " CONFIRM
+    read -p "Type 'YES' in capitals to confirm: " CONFIRM </dev/tty
     if [ "$CONFIRM" != "YES" ]; then
         echo "Uninstallation aborted."
         exit 0
@@ -232,7 +232,7 @@ MAC_LIST=()
 echo -e "${BOLD}MAC Address Whitelisting${NC}"
 echo "  Only laptops whose MAC addresses you whitelist will be allowed to PXE boot."
 echo "  All other machines on the network will be completely ignored."
-read -p "Enable MAC whitelisting? (y/n) [n]: " ENABLE_MAC_FILTER
+read -p "Enable MAC whitelisting? (y/n) [n]: " ENABLE_MAC_FILTER </dev/tty
 ENABLE_MAC_FILTER="${ENABLE_MAC_FILTER:-n}"
 
 if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
@@ -240,7 +240,7 @@ if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
     echo -e "${CYAN}Enter the MAC addresses of allowed machines (format: aa:bb:cc:dd:ee:ff).${NC}"
     echo -e "${CYAN}Type 'done' when finished.${NC}"
     while true; do
-        read -p "  MAC Address: " mac
+        read -p "  MAC Address: " mac </dev/tty
         if [[ "$mac" == "done" ]]; then
             break
         fi
@@ -267,14 +267,14 @@ echo ""
 echo -e "${BOLD}Boot Menu Password Protection${NC}"
 echo "  Even if someone reaches the PXE menu, they must enter a password to boot an OS."
 echo "  (The 'Boot from Local Hard Drive' option will remain unprotected.)"
-read -p "Enable boot menu password? (y/n) [n]: " ENABLE_MENU_PASSWORD
+read -p "Enable boot menu password? (y/n) [n]: " ENABLE_MENU_PASSWORD </dev/tty
 ENABLE_MENU_PASSWORD="${ENABLE_MENU_PASSWORD:-n}"
 
 if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
     while true; do
-        read -sp "  Enter boot menu password: " MENU_PASSWORD
+        read -sp "  Enter boot menu password: " MENU_PASSWORD </dev/tty
         echo ""
-        read -sp "  Confirm password: " MENU_PASSWORD_CONFIRM
+        read -sp "  Confirm password: " MENU_PASSWORD_CONFIRM </dev/tty
         echo ""
         if [ "$MENU_PASSWORD" == "$MENU_PASSWORD_CONFIRM" ] && [ -n "$MENU_PASSWORD" ]; then
             success "Boot menu password set"
