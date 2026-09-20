@@ -14,6 +14,8 @@ curl -sL https://boot.jerrygems.tech | sudo bash
 
 ## Features
 
+- **NetBootSetup ASCII Banner:** Welcomes users with an interactive, branded terminal header.
+- **Pre-Setup Security & Environment Audit:** Proactively scans for disk space shortages (<10GB), port conflicts (8080, 67, 69), and public network exposure risks, prompting the user for confirmation before proceeding.
 - **Dynamic Mirror Querying:** Queries official distro repository mirrors in real-time for full historical version lists.
 - **Multi-Distro & Multi-Version:** Install multiple distros and versions concurrently (Linux Mint, Ubuntu, Xubuntu, Kubuntu, Debian Live, Arch Linux, and Parrot OS).
 - **State Detection & Append Mode:** Automatically detects existing PXE setups and non-destructively appends new operating systems without overwriting configurations or re-downloading existing ISOs.
