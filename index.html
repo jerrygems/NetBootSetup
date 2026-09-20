@@ -1,8 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# Universal PXE Boot Server Setup Script (Production Grade v2.0)
-# Features: Multi-Distro Selection, State Detection & Append Mode,
-#           Security (MAC Whitelisting + Menu Password), Full Uninstall,
+# Universal PXE Boot Server Setup Script (Production Grade v2.1)
+# Features: Dynamic Online Version Querying from Official Mirrors,
+#           Multi-Distro Variety Selection, State Detection & Append Mode,
+#           Security (MAC Whitelisting + Menu Password), Full Clean Uninstall,
 #           Per-Command Verification, Architecture Detection, Auto-Recovery,
 #           High-Speed 16x Parallel Downloads (aria2c)
 # ==============================================================================
@@ -102,7 +103,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.0)${NC}"
+echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.1)${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
 # ==================== PRE-FLIGHT CHECKS ====================
@@ -124,7 +125,7 @@ fi
 # Dependency check - verify critical binaries exist on PATH
 echo -n "Checking for required system tools... "
 MISSING_TOOLS=()
-for tool in mount umount tar sed awk grep ss systemctl; do
+for tool in mount umount tar sed awk grep ss systemctl curl; do
     if ! command -v "$tool" &>/dev/null; then
         MISSING_TOOLS+=("$tool")
     fi
@@ -160,27 +161,6 @@ echo -e "${GREEN}[+] Server IP Address:${NC}  $PI_IP"
 echo -e "${GREEN}[+] Network Subnet:${NC}     $SUBNET"
 echo -e "${CYAN}[i] This script always serves x86_64 boot files to client machines, regardless of server architecture.${NC}"
 echo ""
-
-# ==================== OS CATALOG ====================
-OS_NAMES=(
-    "Linux Mint 21.3 XFCE (Recommended - Bulletproof Casper Boot)"
-    "Linux Mint 21.3 Cinnamon (Full Featured Mint Desktop)"
-    "Xubuntu 24.04 Desktop (Minimal Ubuntu Desktop)"
-    "Ubuntu 22.04.5 LTS Desktop (Rock Solid Long-Term Support)"
-    "Debian 12 Live XFCE (Stable Debian Hybrid)"
-    "Arch Linux (Latest Rolling CLI)"
-)
-OS_URLS=(
-    "https://mirrors.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-xfce-64bit.iso"
-    "https://mirrors.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-cinnamon-64bit.iso"
-    "https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/xubuntu-24.04-desktop-amd64.iso"
-    "https://releases.ubuntu.com/22.04.5/ubuntu-22.04.5-desktop-amd64.iso"
-    "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-12.7.0-amd64-xfce.iso"
-    "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
-)
-OS_ISOS=("mint_xfce.iso" "mint_cinnamon.iso" "xubuntu2404.iso" "ubuntu2204.iso" "debian12_xfce.iso" "arch.iso")
-OS_DIRS=("mint_xfce" "mint_cinnamon" "xubuntu2404" "ubuntu2204" "debian12_xfce" "arch")
-OS_TYPES=("casper" "casper" "casper" "casper" "debian-live" "arch")
 
 # ==================== STATE DETECTION ====================
 SETUP_STATE="NEW"
@@ -251,7 +231,7 @@ if [ "$OS_CHOICE" == "UNINSTALL" ]; then
 
     info "Removing downloaded ISOs & mountpoints..."
     rm -f /var/www/html/*.iso && success "Deleted ISOs" || warn "No ISOs found"
-    rm -rf /var/www/html/archiso /var/www/html/arch 2>/dev/null || true
+    rm -rf /var/www/html/archiso /var/www/html/arch* 2>/dev/null || true
     sed -i '/\/var\/www\/html\/.*loop,ro/d' /etc/fstab 2>/dev/null
 
     info "Removing log file..."
@@ -265,40 +245,282 @@ if [ "$OS_CHOICE" == "UNINSTALL" ]; then
     exit 0
 fi
 
-# ==================== DISTRO SELECTION ====================
+# ==================== DISTRO VARIETIES CATALOG ====================
+DISTRO_OPTIONS=(
+    "Linux Mint (XFCE Edition)"
+    "Linux Mint (Cinnamon Edition)"
+    "Linux Mint (MATE Edition)"
+    "Ubuntu Desktop"
+    "Xubuntu Desktop"
+    "Kubuntu Desktop"
+    "Debian Live (XFCE Edition)"
+    "Debian Live (Cinnamon Edition)"
+    "Debian Live (GNOME Edition)"
+    "Arch Linux"
+)
+
 echo ""
-echo -e "${BOLD}${YELLOW}Operating System Catalog:${NC}"
-echo -e "${CYAN}[i] You can select one or multiple operating systems to install.${NC}"
-for i in "${!OS_NAMES[@]}"; do
-    echo "  $((i+1))) ${OS_NAMES[$i]}"
+echo -e "${BOLD}${YELLOW}Operating System & Variety Catalog:${NC}"
+echo -e "${CYAN}[i] Select one or multiple distro varieties (separated by spaces).${NC}"
+for i in "${!DISTRO_OPTIONS[@]}"; do
+    echo "  $((i+1))) ${DISTRO_OPTIONS[$i]}"
 done
 echo ""
+
 while true; do
-    read -p "Enter number(s) to install separated by spaces (e.g. '1' or '1 3 5'): " -a SELECTED_INPUT </dev/tty
-    VALID_SELECTIONS=()
-    for sel in "${SELECTED_INPUT[@]}"; do
+    read -p "Enter distro number(s) (e.g. '1' or '1 4'): " -a SELECTED_DISTROS </dev/tty
+    CHOSEN_DISTRO_INDICES=()
+    for sel in "${SELECTED_DISTROS[@]}"; do
         if [[ "$sel" =~ ^[0-9]+$ ]]; then
             idx=$((sel-1))
-            if [ -n "${OS_NAMES[$idx]}" ]; then
-                # Avoid duplicate selections in same prompt
-                if [[ ! " ${VALID_SELECTIONS[*]} " =~ " ${idx} " ]]; then
-                    VALID_SELECTIONS+=("$idx")
+            if [ -n "${DISTRO_OPTIONS[$idx]}" ]; then
+                if [[ ! " ${CHOSEN_DISTRO_INDICES[*]} " =~ " ${idx} " ]]; then
+                    CHOSEN_DISTRO_INDICES+=("$idx")
                 fi
             fi
         fi
     done
-    if [ ${#VALID_SELECTIONS[@]} -gt 0 ]; then
+    if [ ${#CHOSEN_DISTRO_INDICES[@]} -gt 0 ]; then
         break
     else
-        warn "No valid choices entered. Please enter numbers from 1 to ${#OS_NAMES[@]}."
+        warn "No valid choices entered. Please enter numbers from 1 to ${#DISTRO_OPTIONS[@]}."
     fi
 done
 
-echo ""
-info "Selected Operating System(s):"
-for idx in "${VALID_SELECTIONS[@]}"; do
-    echo -e "  - ${GREEN}${OS_NAMES[$idx]}${NC}"
+# ==================== DYNAMIC VERSION QUERYING ====================
+
+# Master arrays for resolved download queue
+QUEUE_NAMES=()
+QUEUE_URLS=()
+QUEUE_ISOS=()
+QUEUE_DIRS=()
+QUEUE_TYPES=()
+
+for dist_idx in "${CHOSEN_DISTRO_INDICES[@]}"; do
+    DISTRO_LABEL="${DISTRO_OPTIONS[$dist_idx]}"
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}  Querying Historical Versions for: ${YELLOW}$DISTRO_LABEL${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    info "Contacting official mirror repository indexes..."
+
+    VERSION_LIST=()
+
+    case $dist_idx in
+        0|1|2)
+            # Linux Mint (XFCE, Cinnamon, MATE)
+            RAW_VERS=$(curl -sL --max-time 10 https://mirrors.kernel.org/linuxmint/stable/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | sort -V -r | head -n 16)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("22" "21.3" "21.2" "21.1" "21" "20.3" "20.2" "20.1" "20" "19.3")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        3)
+            # Ubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://releases.ubuntu.com/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04" "16.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        4)
+            # Xubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://cdimage.ubuntu.com/xubuntu/releases/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        5)
+            # Kubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://cdimage.ubuntu.com/kubuntu/releases/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        6|7|8)
+            # Debian Live (XFCE, Cinnamon, GNOME)
+            CUR_DEB=$(curl -sL --max-time 8 https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/ | grep -o 'debian-live-[0-9.]*-amd64' | head -n 1 | sed 's/debian-live-//;s/-amd64//')
+            ARCH_DEB=$(curl -sL --max-time 8 https://cdimage.debian.org/cdimage/archive/ | grep -o '[0-9.]*-live' | sed 's/-live//' | sort -V -r | uniq | head -n 10)
+            if [ -n "$CUR_DEB" ]; then
+                VERSION_LIST+=("$CUR_DEB (Current Stable)")
+            fi
+            if [ -n "$ARCH_DEB" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && VERSION_LIST+=("$line")
+                done <<< "$ARCH_DEB"
+            fi
+            if [ ${#VERSION_LIST[@]} -eq 0 ]; then
+                VERSION_LIST=("12.7.0" "12.6.0" "12.5.0" "11.8.0")
+            fi
+            ;;
+        9)
+            # Arch Linux
+            VERSION_LIST=("Latest (Rolling Release)")
+            ARCH_VERS=$(curl -sL --max-time 8 https://archive.archlinux.org/iso/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | sort -V -r | head -n 12)
+            if [ -n "$ARCH_VERS" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && VERSION_LIST+=("$line")
+                done <<< "$ARCH_VERS"
+            fi
+            ;;
+    esac
+
+    echo -e "${CYAN}Available historical versions from official mirrors:${NC}"
+    for v_idx in "${!VERSION_LIST[@]}"; do
+        echo "  $((v_idx+1))) ${VERSION_LIST[$v_idx]}"
+    done
+    echo ""
+
+    while true; do
+        read -p "Select version(s) for $DISTRO_LABEL (e.g. '1' or '1 3') [1]: " -a CHOSEN_VERS </dev/tty
+        [ ${#CHOSEN_VERS[@]} -eq 0 ] && CHOSEN_VERS=(1)
+        VALID_VER_INDICES=()
+        for vsel in "${CHOSEN_VERS[@]}"; do
+            if [[ "$vsel" =~ ^[0-9]+$ ]]; then
+                vidx=$((vsel-1))
+                if [ -n "${VERSION_LIST[$vidx]}" ]; then
+                    VALID_VER_INDICES+=("$vidx")
+                fi
+            fi
+        done
+        if [ ${#VALID_VER_INDICES[@]} -gt 0 ]; then
+            break
+        else
+            warn "Please select valid version number(s) from 1 to ${#VERSION_LIST[@]}."
+        fi
+    done
+
+    # Resolve exact URLs and names
+    for vidx in "${VALID_VER_INDICES[@]}"; do
+        RAW_V="${VERSION_LIST[$vidx]}"
+        CLEAN_V=$(echo "$RAW_V" | awk '{print $1}')
+
+        case $dist_idx in
+            0) # Mint XFCE
+                FLAVOR="xfce"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V XFCE")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-xfce-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-xfce.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_xfce")
+                QUEUE_TYPES+=("casper")
+                ;;
+            1) # Mint Cinnamon
+                FLAVOR="cinnamon"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V Cinnamon")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-cinnamon-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-cinnamon.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_cin")
+                QUEUE_TYPES+=("casper")
+                ;;
+            2) # Mint MATE
+                FLAVOR="mate"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V MATE")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-mate-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-mate.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_mate")
+                QUEUE_TYPES+=("casper")
+                ;;
+            3) # Ubuntu Desktop
+                info "Resolving exact point release filename for Ubuntu $CLEAN_V..."
+                UB_FILE=$(curl -sL --max-time 8 "https://releases.ubuntu.com/$CLEAN_V/" | grep -o "ubuntu-[0-9.]*-desktop-amd64.iso" | sort -V | tail -n 1)
+                [ -z "$UB_FILE" ] && UB_FILE="ubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Ubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://releases.ubuntu.com/$CLEAN_V/$UB_FILE")
+                QUEUE_ISOS+=("$UB_FILE")
+                QUEUE_DIRS+=("ubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            4) # Xubuntu Desktop
+                info "Resolving exact point release filename for Xubuntu $CLEAN_V..."
+                XUB_FILE=$(curl -sL --max-time 8 "https://cdimage.ubuntu.com/xubuntu/releases/$CLEAN_V/release/" | grep -o "xubuntu-[0-9.]*-desktop-amd64.iso" | head -n 1)
+                [ -z "$XUB_FILE" ] && XUB_FILE="xubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Xubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://cdimage.ubuntu.com/xubuntu/releases/$CLEAN_V/release/$XUB_FILE")
+                QUEUE_ISOS+=("$XUB_FILE")
+                QUEUE_DIRS+=("xubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            5) # Kubuntu Desktop
+                info "Resolving exact point release filename for Kubuntu $CLEAN_V..."
+                KUB_FILE=$(curl -sL --max-time 8 "https://cdimage.ubuntu.com/kubuntu/releases/$CLEAN_V/release/" | grep -o "kubuntu-[0-9.]*-desktop-amd64.iso" | head -n 1)
+                [ -z "$KUB_FILE" ] && KUB_FILE="kubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Kubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://cdimage.ubuntu.com/kubuntu/releases/$CLEAN_V/release/$KUB_FILE")
+                QUEUE_ISOS+=("$KUB_FILE")
+                QUEUE_DIRS+=("kubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            6) # Debian Live XFCE
+                FLAV="xfce"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live XFCE")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_xfce")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            7) # Debian Live Cinnamon
+                FLAV="cinnamon"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live Cinnamon")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_cin")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            8) # Debian Live GNOME
+                FLAV="gnome"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live GNOME")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_gnome")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            9) # Arch Linux
+                if [[ "$RAW_V" =~ "Latest" ]]; then
+                    QUEUE_NAMES+=("Arch Linux (Latest Rolling)")
+                    QUEUE_URLS+=("https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso")
+                    QUEUE_ISOS+=("archlinux-latest.iso")
+                    QUEUE_DIRS+=("arch_latest")
+                else
+                    QUEUE_NAMES+=("Arch Linux ($CLEAN_V)")
+                    QUEUE_URLS+=("https://archive.archlinux.org/iso/$CLEAN_V/archlinux-$CLEAN_V-x86_64.iso")
+                    QUEUE_ISOS+=("archlinux-$CLEAN_V.iso")
+                    QUEUE_DIRS+=("arch_${CLEAN_V//./_}")
+                fi
+                QUEUE_TYPES+=("arch")
+                ;;
+        esac
+    done
 done
+
+echo ""
+echo -e "${GREEN}======================================================${NC}"
+echo -e "${BOLD}${GREEN}Operating Systems Queued for Setup:${NC}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    echo -e "  - ${CYAN}${QUEUE_NAMES[$q_idx]}${NC} (${QUEUE_ISOS[$q_idx]})"
+done
+echo -e "${GREEN}======================================================${NC}"
 
 # ==================== SECURITY OPTIONS ====================
 ENABLE_MAC_FILTER="n"
@@ -450,19 +672,18 @@ verify_file /srv/tftp/ldlinux.c32 "ldlinux.c32" || die "ldlinux.c32 missing"
 # ==================== STEP 4: DOWNLOAD OS ISOs ====================
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLUE}  STEP 4/6: Downloading Selected OS ISOs (16x Parallel)${NC}"
+echo -e "${BLUE}  STEP 4/6: Downloading Queued OS ISOs (16x Parallel)${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 cd /var/www/html
-for idx in "${VALID_SELECTIONS[@]}"; do
-    OS_NAME="${OS_NAMES[$idx]}"
-    ISO_URL="${OS_URLS[$idx]}"
-    ISO_FILE="${OS_ISOS[$idx]}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_URL="${QUEUE_URLS[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
 
     echo ""
     info "Preparing: $OS_NAME ($ISO_FILE)"
-    
-    # Check if file already exists with valid size
+
     if [ -f "/var/www/html/$ISO_FILE" ]; then
         EXISTING_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
         if [ "$EXISTING_SIZE" -gt 100000000 ]; then
@@ -474,7 +695,7 @@ for idx in "${VALID_SELECTIONS[@]}"; do
         fi
     fi
 
-    info "Downloading $OS_NAME ISO with aria2c (16 parallel streams)..."
+    info "Downloading $OS_NAME via aria2c (16 parallel streams)..."
     aria2c -x 16 -s 16 "$ISO_URL" -o "$ISO_FILE" || die "ISO download failed. Check internet or mirror at: $ISO_URL"
     verify_file "/var/www/html/$ISO_FILE" "$ISO_FILE" || die "ISO file missing after download"
 
@@ -492,11 +713,11 @@ echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━�
 echo -e "${BLUE}  STEP 5/6: Extracting Kernel & Initramfs${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-for idx in "${VALID_SELECTIONS[@]}"; do
-    OS_NAME="${OS_NAMES[$idx]}"
-    ISO_FILE="${OS_ISOS[$idx]}"
-    DIR="${OS_DIRS[$idx]}"
-    TYPE="${OS_TYPES[$idx]}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
+    TYPE="${QUEUE_TYPES[$q_idx]}"
 
     echo ""
     info "Extracting boot files for: $OS_NAME"
@@ -507,11 +728,11 @@ for idx in "${VALID_SELECTIONS[@]}"; do
     run "Mounting ISO" mount -o loop /var/www/html/$ISO_FILE /mnt/iso || die "Failed to mount $ISO_FILE. File may be corrupt."
 
     if [ "$TYPE" == "arch" ]; then
-        mkdir -p /var/www/html/arch
+        mkdir -p /var/www/html/$DIR
         if ! grep -q "/var/www/html/$ISO_FILE" /etc/fstab 2>/dev/null; then
-            echo "/var/www/html/$ISO_FILE /var/www/html/arch udf,iso9660 loop,ro 0 0" >> /etc/fstab
+            echo "/var/www/html/$ISO_FILE /var/www/html/$DIR udf,iso9660 loop,ro 0 0" >> /etc/fstab
         fi
-        mountpoint -q /var/www/html/arch || mount /var/www/html/arch 2>/dev/null || mount -o loop /var/www/html/$ISO_FILE /var/www/html/arch
+        mountpoint -q /var/www/html/$DIR || mount /var/www/html/$DIR 2>/dev/null || mount -o loop /var/www/html/$ISO_FILE /var/www/html/$DIR
         run "Copying Arch kernel" cp /mnt/iso/arch/boot/x86_64/vmlinuz-linux /srv/tftp/$DIR/vmlinuz
         run "Copying Arch initramfs" cp /mnt/iso/arch/boot/x86_64/initramfs-linux.img /srv/tftp/$DIR/initrd
         verify_file /srv/tftp/$DIR/vmlinuz "Arch kernel (vmlinuz)"
@@ -585,7 +806,7 @@ fi
 # --- Build / Update PXE Boot Menu ---
 MENU_FILE="/srv/tftp/pxelinux.cfg/default"
 
-# Initialize clean menu if new
+# Initialize clean menu if new or missing
 if [ "$SETUP_STATE" == "NEW" ] || [ ! -f "$MENU_FILE" ]; then
     cat <<EOF > "$MENU_FILE"
 DEFAULT vesamenu.c32
@@ -607,13 +828,12 @@ if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
 fi
 
 # Append / Inject each selected OS into boot menu
-for idx in "${VALID_SELECTIONS[@]}"; do
-    OS_NAME="${OS_NAMES[$idx]}"
-    ISO_FILE="${OS_ISOS[$idx]}"
-    DIR="${OS_DIRS[$idx]}"
-    TYPE="${OS_TYPES[$idx]}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
+    TYPE="${QUEUE_TYPES[$q_idx]}"
 
-    # Check if entry already exists
     if grep -q "^LABEL $DIR$" "$MENU_FILE" 2>/dev/null; then
         warn "Boot menu entry for '$OS_NAME' already exists. Skipping duplicate."
         continue
@@ -624,14 +844,13 @@ for idx in "${VALID_SELECTIONS[@]}"; do
             APPEND_LINE="APPEND initrd=$DIR/initrd boot=casper netboot=url url=http://${PI_IP}:8080/$ISO_FILE ip=dhcp"
             ;;
         arch)
-            APPEND_LINE="APPEND initrd=$DIR/initrd archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/arch/ ip=dhcp"
+            APPEND_LINE="APPEND initrd=$DIR/initrd archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/$DIR/ ip=dhcp"
             ;;
         debian-live)
             APPEND_LINE="APPEND initrd=$DIR/initrd boot=live fetch=http://${PI_IP}:8080/$ISO_FILE components ip=dhcp"
             ;;
     esac
 
-    # Insert above 'LABEL local' so Local Disk remains the last option
     ENTRY="LABEL $DIR\n    MENU LABEL $OS_NAME\n    KERNEL $DIR/vmlinuz\n    $APPEND_LINE"
     if [ -n "$PASSWORD_LINE" ]; then
         ENTRY+="\n$PASSWORD_LINE"
@@ -672,9 +891,9 @@ check "verify_file /srv/tftp/pxelinux.0 pxelinux.0"      "Bootloader: pxelinux.0
 check "verify_file /srv/tftp/vesamenu.c32 vesamenu.c32"   "Bootloader: vesamenu.c32"
 check "verify_file /srv/tftp/pxelinux.cfg/default menu"   "Boot menu config exists"
 
-for idx in "${VALID_SELECTIONS[@]}"; do
-    ISO_FILE="${OS_ISOS[$idx]}"
-    DIR="${OS_DIRS[$idx]}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
     check "verify_file /var/www/html/$ISO_FILE ISO"       "ISO: $ISO_FILE"
     check "verify_file /srv/tftp/$DIR/vmlinuz kernel"     "Kernel for $DIR"
     check "verify_file /srv/tftp/$DIR/initrd initrd"      "Initrd for $DIR"
