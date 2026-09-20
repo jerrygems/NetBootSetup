@@ -15,7 +15,7 @@ curl -sL https://boot.jerrygems.tech | sudo bash
 ## Features
 
 - **Dynamic Mirror Querying:** Queries official distro repository mirrors in real-time for full historical version lists.
-- **Multi-Distro & Multi-Version:** Install multiple distros and versions concurrently (Linux Mint, Ubuntu, Xubuntu, Kubuntu, Debian Live, Arch Linux).
+- **Multi-Distro & Multi-Version:** Install multiple distros and versions concurrently (Linux Mint, Ubuntu, Xubuntu, Kubuntu, Debian Live, Arch Linux, and Parrot OS).
 - **State Detection & Append Mode:** Automatically detects existing PXE setups and non-destructively appends new operating systems without overwriting configurations or re-downloading existing ISOs.
 - **16x High-Speed Downloads:** Uses `aria2c` multi-stream acceleration for maximum bandwidth utilization.
 - **Production Security:** MAC Address whitelisting and masked Boot Menu Password protection.

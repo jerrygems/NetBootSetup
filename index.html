@@ -1,10 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# Universal PXE Boot Server Setup Script (Production Grade v2.1)
+# Universal PXE Boot Server Setup Script (Production Grade v2.2)
 # Features: Dynamic Online Version Querying from Official Mirrors,
-#           Multi-Distro Variety Selection, State Detection & Append Mode,
-#           Security (MAC Whitelisting + Menu Password), Full Clean Uninstall,
-#           Per-Command Verification, Architecture Detection, Auto-Recovery,
+#           Multi-Distro Variety Selection (Mint, Ubuntu, Debian, Arch, Parrot),
+#           State Detection & Append Mode, Security (MAC Whitelisting + Password),
+#           Full Clean Uninstall, Per-Command Verification, Architecture Detection,
 #           High-Speed 16x Parallel Downloads (aria2c)
 # ==============================================================================
 
@@ -103,7 +103,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.1)${NC}"
+echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.2)${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
 # ==================== PRE-FLIGHT CHECKS ====================
@@ -257,6 +257,8 @@ DISTRO_OPTIONS=(
     "Debian Live (Cinnamon Edition)"
     "Debian Live (GNOME Edition)"
     "Arch Linux"
+    "Parrot OS (Security Edition)"
+    "Parrot OS (Home Edition)"
 )
 
 echo ""
@@ -268,7 +270,7 @@ done
 echo ""
 
 while true; do
-    read -p "Enter distro number(s) (e.g. '1' or '1 4'): " -a SELECTED_DISTROS </dev/tty
+    read -p "Enter distro number(s) (e.g. '1' or '1 11'): " -a SELECTED_DISTROS </dev/tty
     CHOSEN_DISTRO_INDICES=()
     for sel in "${SELECTED_DISTROS[@]}"; do
         if [[ "$sel" =~ ^[0-9]+$ ]]; then
@@ -289,7 +291,6 @@ done
 
 # ==================== DYNAMIC VERSION QUERYING ====================
 
-# Master arrays for resolved download queue
 QUEUE_NAMES=()
 QUEUE_URLS=()
 QUEUE_ISOS=()
@@ -373,6 +374,16 @@ for dist_idx in "${CHOSEN_DISTRO_INDICES[@]}"; do
                 done <<< "$ARCH_VERS"
             fi
             ;;
+        10|11)
+            # Parrot OS (Security & Home)
+            RAW_VERS=$(curl -sL --max-time 10 https://deb.parrot.sh/parrot/iso/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("7.3" "7.2" "7.1" "7.0" "6.2" "6.1" "6.0")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
     esac
 
     echo -e "${CYAN}Available historical versions from official mirrors:${NC}"
@@ -400,7 +411,7 @@ for dist_idx in "${CHOSEN_DISTRO_INDICES[@]}"; do
         fi
     done
 
-    # Resolve exact URLs and names
+    # Resolve exact URLs and filenames
     for vidx in "${VALID_VER_INDICES[@]}"; do
         RAW_V="${VERSION_LIST[$vidx]}"
         CLEAN_V=$(echo "$RAW_V" | awk '{print $1}')
@@ -509,6 +520,20 @@ for dist_idx in "${CHOSEN_DISTRO_INDICES[@]}"; do
                     QUEUE_DIRS+=("arch_${CLEAN_V//./_}")
                 fi
                 QUEUE_TYPES+=("arch")
+                ;;
+            10) # Parrot OS Security Edition
+                QUEUE_NAMES+=("Parrot OS $CLEAN_V Security Edition")
+                QUEUE_URLS+=("https://deb.parrot.sh/parrot/iso/$CLEAN_V/Parrot-security-${CLEAN_V}_amd64.iso")
+                QUEUE_ISOS+=("Parrot-security-${CLEAN_V}_amd64.iso")
+                QUEUE_DIRS+=("parrot_${CLEAN_V//./_}_sec")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            11) # Parrot OS Home Edition
+                QUEUE_NAMES+=("Parrot OS $CLEAN_V Home Edition")
+                QUEUE_URLS+=("https://deb.parrot.sh/parrot/iso/$CLEAN_V/Parrot-home-${CLEAN_V}_amd64.iso")
+                QUEUE_ISOS+=("Parrot-home-${CLEAN_V}_amd64.iso")
+                QUEUE_DIRS+=("parrot_${CLEAN_V//./_}_home")
+                QUEUE_TYPES+=("debian-live")
                 ;;
         esac
     done
@@ -751,13 +776,13 @@ for q_idx in "${!QUEUE_NAMES[@]}"; do
         verify_file /srv/tftp/$DIR/initrd "initramfs (initrd)"
     elif [ "$TYPE" == "debian-live" ]; then
         KERNEL_SRC=$(ls /mnt/iso/live/vmlinuz* 2>/dev/null | head -1)
-        INITRD_SRC=$(ls /mnt/iso/live/initrd.img* 2>/dev/null | head -1)
-        [ -z "$KERNEL_SRC" ] && die "Debian live kernel not found in live/"
-        [ -z "$INITRD_SRC" ] && die "Debian live initrd not found in live/"
-        run "Copying Debian live kernel" cp "$KERNEL_SRC" /srv/tftp/$DIR/vmlinuz
-        run "Copying Debian live initrd" cp "$INITRD_SRC" /srv/tftp/$DIR/initrd
-        verify_file /srv/tftp/$DIR/vmlinuz "Debian kernel"
-        verify_file /srv/tftp/$DIR/initrd "Debian initramfs"
+        INITRD_SRC=$(ls /mnt/iso/live/initrd* 2>/dev/null | head -1)
+        [ -z "$KERNEL_SRC" ] && die "Live kernel not found in live/"
+        [ -z "$INITRD_SRC" ] && die "Live initrd not found in live/"
+        run "Copying live kernel" cp "$KERNEL_SRC" /srv/tftp/$DIR/vmlinuz
+        run "Copying live initrd" cp "$INITRD_SRC" /srv/tftp/$DIR/initrd
+        verify_file /srv/tftp/$DIR/vmlinuz "Live kernel"
+        verify_file /srv/tftp/$DIR/initrd "Live initramfs"
     fi
 
     umount /mnt/iso 2>/dev/null || true
