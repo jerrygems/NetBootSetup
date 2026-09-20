@@ -1,8 +1,10 @@
 #!/bin/bash
 # ==============================================================================
-# Universal PXE Boot Server Setup Script (Production Grade)
-# Features: Multi-Distro Selection, State Detection, Append-Mode,
-#           Security (MAC Whitelist + Password), Auto-Recovery
+# Universal PXE Boot Server Setup Script (Production Grade v2.0)
+# Features: Multi-Distro Selection, State Detection & Append Mode,
+#           Security (MAC Whitelisting + Menu Password), Full Uninstall,
+#           Per-Command Verification, Architecture Detection, Auto-Recovery,
+#           High-Speed 16x Parallel Downloads (aria2c)
 # ==============================================================================
 
 # Colors
@@ -18,12 +20,14 @@ NC='\033[0m'
 LOG_FILE="/var/log/pxe_setup.log"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
 
+# Print helpers
 info()    { echo -e "${BLUE}[INFO]${NC} $1"; log "INFO: $1"; }
 success() { echo -e "${GREEN}[  OK  ]${NC} $1"; log "OK: $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; log "WARN: $1"; }
 fail()    { echo -e "${RED}[FAILED]${NC} $1"; log "FAIL: $1"; }
 die()     { fail "$1"; echo -e "${RED}Setup aborted. Check log: $LOG_FILE${NC}"; exit 1; }
 
+# Run a command, verify it succeeds, and print a status line
 run() {
     local description="$1"
     shift
@@ -38,50 +42,151 @@ run() {
     fi
 }
 
+# Verify a file exists after an operation
 verify_file() {
-    if [ -f "$1" ]; then success "Verified: $2 exists"; return 0; else fail "Verification failed: $2 missing"; return 1; fi
-}
-verify_dir() {
-    if [ -d "$1" ]; then success "Verified: $2 exists"; return 0; else fail "Verification failed: $2 missing"; return 1; fi
-}
-verify_service() {
-    if systemctl is-active --quiet "$1" 2>/dev/null; then success "Service '$1' running"; return 0; else fail "Service '$1' NOT running"; return 1; fi
+    local filepath="$1"
+    local label="$2"
+    if [ -f "$filepath" ]; then
+        local size
+        size=$(du -h "$filepath" 2>/dev/null | awk '{print $1}')
+        success "Verified: $label exists ($size)"
+        return 0
+    else
+        fail "Verification failed: $label NOT found at $filepath"
+        return 1
+    fi
 }
 
-cleanup() { mountpoint -q /mnt/iso 2>/dev/null && umount /mnt/iso 2>/dev/null; }
+# Verify a directory exists
+verify_dir() {
+    local dirpath="$1"
+    local label="$2"
+    if [ -d "$dirpath" ]; then
+        success "Verified: $label directory exists"
+        return 0
+    else
+        fail "Verification failed: $label directory NOT found at $dirpath"
+        return 1
+    fi
+}
+
+# Verify a service is active
+verify_service() {
+    local svc="$1"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        success "Service '$svc' is running"
+        return 0
+    else
+        fail "Service '$svc' is NOT running"
+        return 1
+    fi
+}
+
+# Verify a port is listening
+verify_port() {
+    local port="$1"
+    local label="$2"
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        success "$label is listening on port $port"
+        return 0
+    else
+        fail "$label is NOT listening on port $port"
+        return 1
+    fi
+}
+
+# --- Cleanup Trap ---
+cleanup() {
+    mountpoint -q /mnt/iso 2>/dev/null && umount /mnt/iso 2>/dev/null
+}
 trap cleanup EXIT
 
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${GREEN}   Universal PXE Boot Server Setup (v2.0)${NC}"
+echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.0)${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
-if [[ $EUID -ne 0 ]]; then die "This script must be run as root. Try: sudo $0"; fi
+# ==================== PRE-FLIGHT CHECKS ====================
 
+# Root check
+if [[ $EUID -ne 0 ]]; then
+    die "This script must be run as root. Try: sudo $0"
+fi
+
+# Internet check
+echo -n "Checking internet connection... "
+if ping -c 1 -W 5 8.8.8.8 &> /dev/null; then
+    echo -e "${GREEN}OK${NC}"
+else
+    echo -e "${RED}FAILED${NC}"
+    die "No internet connection detected. Connect your server to the internet and retry."
+fi
+
+# Dependency check - verify critical binaries exist on PATH
+echo -n "Checking for required system tools... "
+MISSING_TOOLS=()
+for tool in mount umount tar sed awk grep ss systemctl; do
+    if ! command -v "$tool" &>/dev/null; then
+        MISSING_TOOLS+=("$tool")
+    fi
+done
+if [ ${#MISSING_TOOLS[@]} -gt 0 ]; then
+    echo -e "${RED}FAILED${NC}"
+    die "Missing critical system tools: ${MISSING_TOOLS[*]}"
+fi
+echo -e "${GREEN}OK${NC}"
+
+# Architecture detection
+SERVER_ARCH=$(uname -m)
+case "$SERVER_ARCH" in
+    x86_64)       ARCH_LABEL="x86_64 (Intel/AMD 64-bit)" ;;
+    aarch64)      ARCH_LABEL="aarch64 (ARM 64-bit, e.g. Raspberry Pi)" ;;
+    armv7l)       ARCH_LABEL="armv7l (ARM 32-bit)" ;;
+    *)            ARCH_LABEL="$SERVER_ARCH (Unknown)" ;;
+esac
+
+# Network detection
 PI_IP=$(hostname -I | awk '{print $1}')
-if [ -z "$PI_IP" ]; then die "Could not detect a valid IP address."; fi
+if [ -z "$PI_IP" ]; then
+    die "Could not detect a valid IP address. Is your server connected to the network?"
+fi
 SUBNET_PREFIX=$(echo "$PI_IP" | cut -d. -f1,2,3)
 SUBNET="${SUBNET_PREFIX}.0"
 HOSTNAME=$(hostname)
 
+echo ""
+echo -e "${GREEN}[+] Server Architecture:${NC} $ARCH_LABEL"
+echo -e "${GREEN}[+] Server Hostname:${NC}    $HOSTNAME"
+echo -e "${GREEN}[+] Server IP Address:${NC}  $PI_IP"
+echo -e "${GREEN}[+] Network Subnet:${NC}     $SUBNET"
+echo -e "${CYAN}[i] This script always serves x86_64 boot files to client machines, regardless of server architecture.${NC}"
+echo ""
+
 # ==================== OS CATALOG ====================
-OS_NAMES=("Linux Mint 21.3 XFCE" "Linux Mint 21.3 Cinnamon" "Ubuntu 24.04 Desktop" "Ubuntu 22.04 Desktop" "Debian 12 XFCE Live" "Arch Linux (Latest)")
+OS_NAMES=(
+    "Linux Mint 21.3 XFCE (Recommended - Bulletproof Casper Boot)"
+    "Linux Mint 21.3 Cinnamon (Full Featured Mint Desktop)"
+    "Xubuntu 24.04 Desktop (Minimal Ubuntu Desktop)"
+    "Ubuntu 22.04.5 LTS Desktop (Rock Solid Long-Term Support)"
+    "Debian 12 Live XFCE (Stable Debian Hybrid)"
+    "Arch Linux (Latest Rolling CLI)"
+)
 OS_URLS=(
     "https://mirrors.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-xfce-64bit.iso"
     "https://mirrors.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-cinnamon-64bit.iso"
-    "https://releases.ubuntu.com/24.04.1/ubuntu-24.04.1-desktop-amd64.iso"
+    "https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/xubuntu-24.04-desktop-amd64.iso"
     "https://releases.ubuntu.com/22.04.5/ubuntu-22.04.5-desktop-amd64.iso"
     "https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-12.7.0-amd64-xfce.iso"
     "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
 )
-OS_ISOS=("mint213_xfce.iso" "mint213_cin.iso" "ubuntu2404.iso" "ubuntu2204.iso" "debian12.iso" "arch.iso")
-OS_DIRS=("mint213_xfce" "mint213_cin" "ubuntu2404" "ubuntu2204" "debian12" "arch")
+OS_ISOS=("mint_xfce.iso" "mint_cinnamon.iso" "xubuntu2404.iso" "ubuntu2204.iso" "debian12_xfce.iso" "arch.iso")
+OS_DIRS=("mint_xfce" "mint_cinnamon" "xubuntu2404" "ubuntu2204" "debian12_xfce" "arch")
 OS_TYPES=("casper" "casper" "casper" "casper" "debian-live" "arch")
 
 # ==================== STATE DETECTION ====================
 SETUP_STATE="NEW"
-if [ -f /srv/tftp/pxelinux.cfg/default ] && [ -d /var/www/html ]; then
+if [ -f /srv/tftp/pxelinux.cfg/default ] && [ -d /var/www/html ] && systemctl is-active --quiet apache2 2>/dev/null; then
     SETUP_STATE="EXISTING"
-    echo -e "${GREEN}[*] Existing PXE network boot setup detected on this server!${NC}"
+    echo -e "${GREEN}[*] Existing PXE network boot server detected on this machine!${NC}"
     echo ""
 fi
 
@@ -89,177 +194,400 @@ fi
 while true; do
     if [ "$SETUP_STATE" == "EXISTING" ]; then
         echo -e "${BOLD}${YELLOW}What would you like to do?${NC}"
-        echo "  1) Add more Distros to existing PXE Menu"
-        echo "  2) Wipe & Reinstall PXE Setup completely"
-        echo -e "  ${RED}3) Uninstall completely & Clean Up${NC}"
+        echo "  1) Add more Distros to existing PXE Boot Menu (Append Mode)"
+        echo "  2) Wipe & Reinstall PXE Server completely (Fresh Setup)"
+        echo -e "  ${RED}3) Uninstall: Remove PXE Server & Clean Up${NC}"
         echo "  4) Exit"
+        echo ""
         read -p "Enter choice [1-4]: " ACTION_CHOICE </dev/tty
+        case $ACTION_CHOICE in
+            1) break ;;
+            2) SETUP_STATE="NEW"; break ;;
+            3) OS_CHOICE="UNINSTALL"; break ;;
+            4) echo "Exiting."; exit 0 ;;
+            *) echo -e "${RED}Invalid choice. Please enter 1, 2, 3, or 4.${NC}" ;;
+        esac
     else
-        echo -e "${BOLD}${YELLOW}Welcome to the PXE Setup. What would you like to do?${NC}"
-        echo "  1) Start Fresh Setup"
-        echo "  4) Exit"
-        read -p "Enter choice [1 or 4]: " ACTION_CHOICE </dev/tty
+        echo -e "${BOLD}${YELLOW}What would you like to do?${NC}"
+        echo "  1) Start Universal PXE Server Setup"
+        echo -e "  ${RED}2) Uninstall: Remove PXE Server & Clean Up${NC}"
+        echo "  3) Exit"
+        echo ""
+        read -p "Enter choice [1-3]: " ACTION_CHOICE </dev/tty
+        case $ACTION_CHOICE in
+            1) break ;;
+            2) OS_CHOICE="UNINSTALL"; break ;;
+            3) echo "Exiting."; exit 0 ;;
+            *) echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}" ;;
+        esac
     fi
-    
-    case $ACTION_CHOICE in
-        1) break ;;
-        2) SETUP_STATE="NEW"; break ;;
-        3) 
-           if [ "$SETUP_STATE" == "EXISTING" ]; then
-               read -p "Type 'YES' to confirm full uninstall: " CONFIRM </dev/tty
-               if [ "$CONFIRM" == "YES" ]; then
-                   systemctl stop dnsmasq apache2 2>/dev/null
-                   apt purge -y dnsmasq apache2 pxelinux syslinux-common aria2 &>/dev/null
-                   apt autoremove -y &>/dev/null
-                   rm -rf /srv/tftp /var/www/html/*.iso
-                   sed -i '/loop,ro/d' /etc/fstab 2>/dev/null # Remove loop mounts
-                   echo -e "${GREEN}Uninstallation complete!${NC}"; exit 0
-               else
-                   echo "Aborted."; exit 0
-               fi
-           fi
-           ;;
-        4) echo "Exiting."; exit 0 ;;
-        *) echo -e "${RED}Invalid choice.${NC}" ;;
-    esac
 done
+
+# ==================== UNINSTALLATION ====================
+if [ "$OS_CHOICE" == "UNINSTALL" ]; then
+    echo ""
+    echo -e "${RED}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║  WARNING: This will completely remove the PXE       ║${NC}"
+    echo -e "${RED}║  server, all downloaded ISOs, and related packages. ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════╝${NC}"
+    read -p "Type 'YES' in capitals to confirm: " CONFIRM </dev/tty
+    if [ "$CONFIRM" != "YES" ]; then
+        echo "Uninstallation aborted."
+        exit 0
+    fi
+
+    echo ""
+    info "Stopping services..."
+    systemctl stop dnsmasq 2>/dev/null && success "Stopped dnsmasq" || warn "dnsmasq was not running"
+    systemctl stop apache2 2>/dev/null && success "Stopped apache2" || warn "apache2 was not running"
+    systemctl disable dnsmasq apache2 2>/dev/null || true
+
+    info "Purging packages..."
+    apt purge -y dnsmasq dnsmasq-base apache2 apache2-utils pxelinux syslinux-common aria2 &>/dev/null && success "Packages purged" || warn "Some packages were already removed"
+    apt autoremove -y &>/dev/null
+
+    info "Removing TFTP directory..."
+    rm -rf /srv/tftp && success "Deleted /srv/tftp" || warn "/srv/tftp did not exist"
+
+    info "Removing downloaded ISOs & mountpoints..."
+    rm -f /var/www/html/*.iso && success "Deleted ISOs" || warn "No ISOs found"
+    rm -rf /var/www/html/archiso /var/www/html/arch 2>/dev/null || true
+    sed -i '/\/var\/www\/html\/.*loop,ro/d' /etc/fstab 2>/dev/null
+
+    info "Removing log file..."
+    rm -f "$LOG_FILE" 2>/dev/null || true
+
+    echo ""
+    echo -e "${GREEN}======================================================${NC}"
+    echo -e "${GREEN}   UNINSTALLATION COMPLETE! 🧹${NC}"
+    echo -e "${GREEN}   Your server is clean.${NC}"
+    echo -e "${GREEN}======================================================${NC}"
+    exit 0
+fi
 
 # ==================== DISTRO SELECTION ====================
 echo ""
-echo -e "${BOLD}${CYAN}Available Operating Systems:${NC}"
+echo -e "${BOLD}${YELLOW}Operating System Catalog:${NC}"
+echo -e "${CYAN}[i] You can select one or multiple operating systems to install.${NC}"
 for i in "${!OS_NAMES[@]}"; do
     echo "  $((i+1))) ${OS_NAMES[$i]}"
 done
 echo ""
-echo "You can select multiple operating systems by separating them with spaces."
-read -p "Enter the numbers you want to install (e.g., '1 3 5'): " -a SELECTED_DISTROS </dev/tty
-
-if [ ${#SELECTED_DISTROS[@]} -eq 0 ]; then die "No distros selected."; fi
-
-# Validate selections
-VALID_SELECTIONS=()
-for sel in "${SELECTED_DISTROS[@]}"; do
-    idx=$((sel-1))
-    if [ -n "${OS_NAMES[$idx]}" ]; then
-        VALID_SELECTIONS+=($idx)
+while true; do
+    read -p "Enter number(s) to install separated by spaces (e.g. '1' or '1 3 5'): " -a SELECTED_INPUT </dev/tty
+    VALID_SELECTIONS=()
+    for sel in "${SELECTED_INPUT[@]}"; do
+        if [[ "$sel" =~ ^[0-9]+$ ]]; then
+            idx=$((sel-1))
+            if [ -n "${OS_NAMES[$idx]}" ]; then
+                # Avoid duplicate selections in same prompt
+                if [[ ! " ${VALID_SELECTIONS[*]} " =~ " ${idx} " ]]; then
+                    VALID_SELECTIONS+=("$idx")
+                fi
+            fi
+        fi
+    done
+    if [ ${#VALID_SELECTIONS[@]} -gt 0 ]; then
+        break
     else
-        warn "Invalid selection: $sel (Skipping)"
+        warn "No valid choices entered. Please enter numbers from 1 to ${#OS_NAMES[@]}."
     fi
 done
-if [ ${#VALID_SELECTIONS[@]} -eq 0 ]; then die "No valid distros selected."; fi
 
-# ==================== SECURITY OPTIONS (NEW SETUPS ONLY) ====================
+echo ""
+info "Selected Operating System(s):"
+for idx in "${VALID_SELECTIONS[@]}"; do
+    echo -e "  - ${GREEN}${OS_NAMES[$idx]}${NC}"
+done
+
+# ==================== SECURITY OPTIONS ====================
 ENABLE_MAC_FILTER="n"
+MAC_LIST=()
 ENABLE_MENU_PASSWORD="n"
+MENU_PASSWORD=""
+
 if [ "$SETUP_STATE" == "NEW" ]; then
     echo ""
-    read -p "Enable MAC whitelisting? (Only allowed laptops can boot) (y/n) [n]: " ENABLE_MAC_FILTER </dev/tty
+    echo -e "${BOLD}${YELLOW}Security Configuration:${NC}"
+    echo -e "${CYAN}[i] These features prevent unauthorized machines from booting off your server.${NC}"
+    echo ""
+
+    # --- MAC Address Whitelisting ---
+    echo -e "${BOLD}MAC Address Whitelisting${NC}"
+    echo "  Only laptops whose MAC addresses you whitelist will be allowed to PXE boot."
+    echo "  All other machines on the network will be completely ignored."
+    read -p "Enable MAC whitelisting? (y/n) [n]: " ENABLE_MAC_FILTER </dev/tty
     ENABLE_MAC_FILTER="${ENABLE_MAC_FILTER:-n}"
-    
-    MAC_LIST=()
+
     if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
-        echo -e "${CYAN}Enter MAC addresses (aa:bb:cc:dd:ee:ff). Type 'done' to finish.${NC}"
+        echo ""
+        echo -e "${CYAN}Enter the MAC addresses of allowed machines (format: aa:bb:cc:dd:ee:ff).${NC}"
+        echo -e "${CYAN}Type 'done' when finished.${NC}"
         while true; do
             read -p "  MAC Address: " mac </dev/tty
-            if [[ "$mac" == "done" ]]; then break; fi
+            if [[ "$mac" == "done" ]]; then
+                break
+            fi
             if [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-                MAC_LIST+=("$mac"); success "Added: $mac"
+                MAC_LIST+=("$mac")
+                success "Added: $mac"
             else
-                warn "Invalid format."
+                warn "Invalid MAC format. Use aa:bb:cc:dd:ee:ff"
             fi
         done
+        if [ ${#MAC_LIST[@]} -eq 0 ]; then
+            warn "No MACs entered. Disabling MAC whitelisting."
+            ENABLE_MAC_FILTER="n"
+        else
+            success "${#MAC_LIST[@]} MAC address(es) whitelisted"
+        fi
     fi
 
+    # --- Boot Menu Password ---
     echo ""
-    read -p "Enable Boot Menu Password? (y/n) [n]: " ENABLE_MENU_PASSWORD </dev/tty
+    echo -e "${BOLD}Boot Menu Password Protection${NC}"
+    echo "  Even if someone reaches the PXE menu, they must enter a password to boot an OS."
+    echo "  (The 'Boot from Local Hard Drive' option will remain unprotected.)"
+    read -p "Enable boot menu password? (y/n) [n]: " ENABLE_MENU_PASSWORD </dev/tty
     ENABLE_MENU_PASSWORD="${ENABLE_MENU_PASSWORD:-n}"
+
     if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
         while true; do
-            read -sp "  Enter password: " MENU_PASSWORD </dev/tty
-            echo ""; read -sp "  Confirm: " MENU_PASSWORD_CONFIRM </dev/tty
+            read -sp "  Enter boot menu password: " MENU_PASSWORD </dev/tty
+            echo ""
+            read -sp "  Confirm password: " MENU_PASSWORD_CONFIRM </dev/tty
             echo ""
             if [ "$MENU_PASSWORD" == "$MENU_PASSWORD_CONFIRM" ] && [ -n "$MENU_PASSWORD" ]; then
-                success "Password set"; break
+                success "Boot menu password set"
+                break
             else
-                warn "Passwords didn't match. Try again."
+                warn "Passwords did not match or were empty. Try again."
             fi
         done
     fi
+else
+    info "Preserving existing security configuration (dnsmasq & menu settings)."
 fi
 
-# ==================== CORE SETUP (NEW ONLY) ====================
+# ==================== STEP 1: INSTALL PACKAGES ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 1/6: Checking / Installing Packages${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
 if [ "$SETUP_STATE" == "NEW" ]; then
-    echo -e "\n${BLUE}--- Installing Base PXE Packages ---${NC}"
-    apt update -y &>/dev/null
-    apt install -y dnsmasq apache2 pxelinux syslinux-common aria2 wget &>/dev/null || die "Package install failed"
-    
-    sed -i 's/Listen 80$/Listen 8080/' /etc/apache2/ports.conf
-    mv /var/www/html/index.html /var/www/html/index.html.backup 2>/dev/null || true
-    systemctl restart apache2
-    
-    mkdir -p /srv/tftp/pxelinux.cfg
-    cd /tmp; rm -f netboot.tar.gz
-    wget -q https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images/netboot/netboot.tar.gz
-    tar -xzf netboot.tar.gz
-    cp /tmp/debian-installer/amd64/pxelinux.0 /srv/tftp/
-    cp /tmp/debian-installer/amd64/boot-screens/*.c32 /srv/tftp/
-    rm -rf /tmp/debian-installer /tmp/netboot.tar.gz
+    run "Updating package lists" apt update -y
+    run "Installing dnsmasq" apt install -y dnsmasq || die "Failed to install dnsmasq"
+    run "Installing apache2" apt install -y apache2 || die "Failed to install apache2"
+    run "Installing pxelinux" apt install -y pxelinux syslinux-common || die "Failed to install pxelinux"
+    run "Installing aria2 download accelerator" apt install -y aria2 || die "Failed to install aria2"
+    run "Installing wget" apt install -y wget || die "Failed to install wget"
+else
+    info "Verifying required packages are installed..."
+    for pkg in dnsmasq apache2 pxelinux syslinux-common aria2 wget; do
+        if ! dpkg -s "$pkg" &>/dev/null; then
+            run "Installing missing package: $pkg" apt install -y "$pkg" || die "Failed to install $pkg"
+        fi
+    done
 fi
 
-# ==================== DOWNLOAD & EXTRACT LOOP ====================
-echo -e "\n${BLUE}--- Downloading and Preparing Operating Systems ---${NC}"
-cd /var/www/html
+for bin in dnsmasq apache2 aria2c wget; do
+    command -v "$bin" &>/dev/null || die "'$bin' binary not found after installation"
+done
+success "All packages installed and verified on PATH"
 
+# ==================== STEP 2: CONFIGURE APACHE ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 2/6: Configuring Apache Web Server (Port 8080)${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+if grep -q "Listen 80$" /etc/apache2/ports.conf 2>/dev/null; then
+    run "Switching Apache from port 80 to 8080" sed -i 's/Listen 80$/Listen 8080/' /etc/apache2/ports.conf
+else
+    success "Apache already configured for port 8080 (skipping)"
+fi
+
+if [ -f /var/www/html/index.html ]; then
+    run "Backing up default index.html (enables file browser)" mv /var/www/html/index.html /var/www/html/index.html.backup
+else
+    success "Default index.html already removed (skipping)"
+fi
+
+run "Restarting Apache" systemctl restart apache2 || die "Apache failed to start. Check port conflicts with: ss -tlnp | grep 8080"
+verify_service "apache2" || die "Apache is not running after restart"
+verify_port 8080 "Apache" || die "Apache is not listening on port 8080"
+
+# ==================== STEP 3: SETUP TFTP BOOTLOADER ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 3/6: Setting Up TFTP Bootloader (x86_64 files)${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+run "Creating TFTP directories" mkdir -p /srv/tftp/pxelinux.cfg
+verify_dir /srv/tftp/pxelinux.cfg "TFTP config" || die "Failed to create TFTP directories"
+
+if [ ! -f /srv/tftp/pxelinux.0 ] || [ ! -f /srv/tftp/vesamenu.c32 ] || [ "$SETUP_STATE" == "NEW" ]; then
+    cd /tmp
+    rm -f netboot.tar.gz
+    run "Downloading Debian amd64 netboot bootloader" wget -q --show-progress https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images/netboot/netboot.tar.gz || die "Failed to download bootloader archive"
+    verify_file /tmp/netboot.tar.gz "netboot.tar.gz" || die "Bootloader archive download is missing or empty"
+
+    run "Extracting bootloader archive" tar -xzf netboot.tar.gz
+    verify_dir /tmp/debian-installer/amd64 "Extracted bootloader" || die "Bootloader archive did not extract correctly"
+
+    run "Copying pxelinux.0" cp /tmp/debian-installer/amd64/pxelinux.0 /srv/tftp/
+    run "Copying .c32 menu modules" cp /tmp/debian-installer/amd64/boot-screens/*.c32 /srv/tftp/
+    run "Cleaning up temp files" rm -rf /tmp/debian-installer /tmp/netboot.tar.gz
+else
+    success "Bootloader files already present (skipping redownload)"
+fi
+
+verify_file /srv/tftp/pxelinux.0 "pxelinux.0" || die "pxelinux.0 missing"
+verify_file /srv/tftp/vesamenu.c32 "vesamenu.c32" || die "vesamenu.c32 missing"
+verify_file /srv/tftp/ldlinux.c32 "ldlinux.c32" || die "ldlinux.c32 missing"
+
+# ==================== STEP 4: DOWNLOAD OS ISOs ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 4/6: Downloading Selected OS ISOs (16x Parallel)${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+cd /var/www/html
 for idx in "${VALID_SELECTIONS[@]}"; do
-    NAME="${OS_NAMES[$idx]}"
-    URL="${OS_URLS[$idx]}"
-    ISO="${OS_ISOS[$idx]}"
-    DIR="${OS_DIRS[$idx]}"
-    TYPE="${OS_TYPES[$idx]}"
+    OS_NAME="${OS_NAMES[$idx]}"
+    ISO_URL="${OS_URLS[$idx]}"
+    ISO_FILE="${OS_ISOS[$idx]}"
+
+    echo ""
+    info "Preparing: $OS_NAME ($ISO_FILE)"
     
-    echo -e "\n${BOLD}${CYAN}Processing: $NAME${NC}"
-    
-    if [ -f "/var/www/html/$ISO" ]; then
-        success "ISO already exists: $ISO"
-    else
-        info "Downloading $ISO..."
-        aria2c -x 16 -s 16 "$URL" -o "$ISO" || die "Failed to download $NAME"
-    fi
-    
-    chmod 644 "/var/www/html/$ISO"
-    mkdir -p /srv/tftp/$DIR
-    mkdir -p /mnt/iso
-    umount /mnt/iso 2>/dev/null || true
-    mount -o loop /var/www/html/$ISO /mnt/iso || die "Failed to mount $ISO"
-    
-    # Extract kernel and initrd based on type
-    if [ "$TYPE" == "arch" ]; then
-        # Arch needs the whole ISO mounted persistently for HTTP rootfs fetching
-        mkdir -p /var/www/html/$DIR
-        if ! grep -q "/var/www/html/$ISO" /etc/fstab; then
-            echo "/var/www/html/$ISO /var/www/html/$DIR udf,iso9660 loop,ro 0 0" >> /etc/fstab
+    # Check if file already exists with valid size
+    if [ -f "/var/www/html/$ISO_FILE" ]; then
+        EXISTING_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
+        if [ "$EXISTING_SIZE" -gt 100000000 ]; then
+            success "Valid ISO already exists: $ISO_FILE ($(du -h /var/www/html/$ISO_FILE | awk '{print $1}')) - Skipping download"
+            continue
+        else
+            warn "Existing ISO file is corrupted or incomplete (<100MB). Redownloading..."
+            rm -f "/var/www/html/$ISO_FILE"
         fi
-        mount /var/www/html/$DIR 2>/dev/null || true
-        cp /var/www/html/$DIR/arch/boot/x86_64/vmlinuz-linux /srv/tftp/$DIR/vmlinuz
-        cp /var/www/html/$DIR/arch/boot/x86_64/initramfs-linux.img /srv/tftp/$DIR/initrd
-    elif [ "$TYPE" == "casper" ]; then
-        cp /mnt/iso/casper/vmlinuz /srv/tftp/$DIR/
-        if [ -f /mnt/iso/casper/initrd.lz ]; then cp /mnt/iso/casper/initrd.lz /srv/tftp/$DIR/initrd; 
-        elif [ -f /mnt/iso/casper/initrd ]; then cp /mnt/iso/casper/initrd /srv/tftp/$DIR/initrd; 
-        else die "Initrd not found in casper for $NAME"; fi
-    elif [ "$TYPE" == "debian-live" ]; then
-        cp /mnt/iso/live/vmlinuz-* /srv/tftp/$DIR/vmlinuz
-        cp /mnt/iso/live/initrd.img-* /srv/tftp/$DIR/initrd
     fi
-    umount /mnt/iso 2>/dev/null || true
-    success "Kernel & Initrd extracted to /srv/tftp/$DIR/"
+
+    info "Downloading $OS_NAME ISO with aria2c (16 parallel streams)..."
+    aria2c -x 16 -s 16 "$ISO_URL" -o "$ISO_FILE" || die "ISO download failed. Check internet or mirror at: $ISO_URL"
+    verify_file "/var/www/html/$ISO_FILE" "$ISO_FILE" || die "ISO file missing after download"
+
+    ISO_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
+    if [ "$ISO_SIZE" -lt 100000000 ]; then
+        die "Downloaded ISO is only $(du -h /var/www/html/$ISO_FILE | awk '{print $1}'). This is likely corrupt or a 404 error page. Delete and retry."
+    fi
+    success "ISO size verified: $(du -h /var/www/html/$ISO_FILE | awk '{print $1}')"
+    run "Setting file permissions" chmod 644 /var/www/html/$ISO_FILE
 done
 
-# ==================== BUILD PXE MENU ====================
-echo -e "\n${BLUE}--- Rebuilding PXE Menu ---${NC}"
+# ==================== STEP 5: EXTRACT KERNEL & INITRAMFS ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 5/6: Extracting Kernel & Initramfs${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
+for idx in "${VALID_SELECTIONS[@]}"; do
+    OS_NAME="${OS_NAMES[$idx]}"
+    ISO_FILE="${OS_ISOS[$idx]}"
+    DIR="${OS_DIRS[$idx]}"
+    TYPE="${OS_TYPES[$idx]}"
+
+    echo ""
+    info "Extracting boot files for: $OS_NAME"
+    run "Creating TFTP directory /srv/tftp/$DIR" mkdir -p /srv/tftp/$DIR
+    mkdir -p /mnt/iso
+    umount /mnt/iso 2>/dev/null || true
+
+    run "Mounting ISO" mount -o loop /var/www/html/$ISO_FILE /mnt/iso || die "Failed to mount $ISO_FILE. File may be corrupt."
+
+    if [ "$TYPE" == "arch" ]; then
+        mkdir -p /var/www/html/arch
+        if ! grep -q "/var/www/html/$ISO_FILE" /etc/fstab 2>/dev/null; then
+            echo "/var/www/html/$ISO_FILE /var/www/html/arch udf,iso9660 loop,ro 0 0" >> /etc/fstab
+        fi
+        mountpoint -q /var/www/html/arch || mount /var/www/html/arch 2>/dev/null || mount -o loop /var/www/html/$ISO_FILE /var/www/html/arch
+        run "Copying Arch kernel" cp /mnt/iso/arch/boot/x86_64/vmlinuz-linux /srv/tftp/$DIR/vmlinuz
+        run "Copying Arch initramfs" cp /mnt/iso/arch/boot/x86_64/initramfs-linux.img /srv/tftp/$DIR/initrd
+        verify_file /srv/tftp/$DIR/vmlinuz "Arch kernel (vmlinuz)"
+        verify_file /srv/tftp/$DIR/initrd "Arch initramfs (initrd)"
+    elif [ "$TYPE" == "casper" ]; then
+        run "Copying vmlinuz" cp /mnt/iso/casper/vmlinuz /srv/tftp/$DIR/vmlinuz || die "vmlinuz not found in casper/"
+        verify_file /srv/tftp/$DIR/vmlinuz "vmlinuz kernel"
+
+        if [ -f /mnt/iso/casper/initrd.lz ]; then
+            run "Copying initrd.lz" cp /mnt/iso/casper/initrd.lz /srv/tftp/$DIR/initrd
+        elif [ -f /mnt/iso/casper/initrd ]; then
+            run "Copying initrd" cp /mnt/iso/casper/initrd /srv/tftp/$DIR/initrd
+        else
+            die "No initrd found inside ISO casper/ directory."
+        fi
+        verify_file /srv/tftp/$DIR/initrd "initramfs (initrd)"
+    elif [ "$TYPE" == "debian-live" ]; then
+        KERNEL_SRC=$(ls /mnt/iso/live/vmlinuz* 2>/dev/null | head -1)
+        INITRD_SRC=$(ls /mnt/iso/live/initrd.img* 2>/dev/null | head -1)
+        [ -z "$KERNEL_SRC" ] && die "Debian live kernel not found in live/"
+        [ -z "$INITRD_SRC" ] && die "Debian live initrd not found in live/"
+        run "Copying Debian live kernel" cp "$KERNEL_SRC" /srv/tftp/$DIR/vmlinuz
+        run "Copying Debian live initrd" cp "$INITRD_SRC" /srv/tftp/$DIR/initrd
+        verify_file /srv/tftp/$DIR/vmlinuz "Debian kernel"
+        verify_file /srv/tftp/$DIR/initrd "Debian initramfs"
+    fi
+
+    umount /mnt/iso 2>/dev/null || true
+    success "Extraction complete for $OS_NAME"
+done
+
+# ==================== STEP 6: CONFIGURE SERVICES & BOOT MENU ====================
+echo ""
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}  STEP 6/6: Configuring dnsmasq & Boot Menu${NC}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# --- Configure dnsmasq (New Setup Only) ---
 if [ "$SETUP_STATE" == "NEW" ]; then
-    cat <<EOF > /srv/tftp/pxelinux.cfg/default
+    if [ ! -f /etc/dnsmasq.conf.backup ]; then
+        cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup 2>/dev/null || true
+    fi
+
+    DNSMASQ_CONF="# === PXE Server Configuration (Auto-Generated) ===
+port=0
+enable-tftp
+tftp-root=/srv/tftp
+log-dhcp
+
+# Proxy DHCP - works alongside your existing router
+dhcp-range=${SUBNET},proxy
+pxe-service=x86PC, \"Network Boot\", pxelinux
+dhcp-boot=pxelinux.0, ${HOSTNAME}, ${PI_IP}"
+
+    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
+        DNSMASQ_CONF+="\n\n# === MAC Address Whitelisting ===\ndhcp-ignore=tag:!known"
+        for mac in "${MAC_LIST[@]}"; do
+            DNSMASQ_CONF+="\ndhcp-host=${mac},set:known"
+        done
+    fi
+
+    echo -e "$DNSMASQ_CONF" > /etc/dnsmasq.conf
+    success "dnsmasq.conf written"
+
+    run "Restarting dnsmasq" systemctl restart dnsmasq || die "dnsmasq failed to start. Run: journalctl -xeu dnsmasq"
+    run "Enabling dnsmasq on boot" systemctl enable dnsmasq
+else
+    success "Preserving existing dnsmasq configuration"
+fi
+
+# --- Build / Update PXE Boot Menu ---
+MENU_FILE="/srv/tftp/pxelinux.cfg/default"
+
+# Initialize clean menu if new
+if [ "$SETUP_STATE" == "NEW" ] || [ ! -f "$MENU_FILE" ]; then
+    cat <<EOF > "$MENU_FILE"
 DEFAULT vesamenu.c32
 PROMPT 0
 TIMEOUT 300
@@ -269,55 +597,123 @@ LABEL local
     MENU LABEL Boot from Local Hard Drive
     LOCALBOOT 0
 EOF
+    success "Initialized fresh boot menu"
 fi
 
+# Password line (if enabled on new setup)
 PASSWORD_LINE=""
 if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
     PASSWORD_LINE="    MENU PASSWD $MENU_PASSWORD"
 fi
 
+# Append / Inject each selected OS into boot menu
 for idx in "${VALID_SELECTIONS[@]}"; do
-    NAME="${OS_NAMES[$idx]}"
-    ISO="${OS_ISOS[$idx]}"
+    OS_NAME="${OS_NAMES[$idx]}"
+    ISO_FILE="${OS_ISOS[$idx]}"
     DIR="${OS_DIRS[$idx]}"
     TYPE="${OS_TYPES[$idx]}"
-    
+
     # Check if entry already exists
-    if grep -q "LABEL $DIR" /srv/tftp/pxelinux.cfg/default; then
-        warn "Menu entry for $NAME already exists. Skipping duplicate."
+    if grep -q "^LABEL $DIR$" "$MENU_FILE" 2>/dev/null; then
+        warn "Boot menu entry for '$OS_NAME' already exists. Skipping duplicate."
         continue
     fi
-    
+
     case "$TYPE" in
-        casper) APPEND_LINE="APPEND initrd=$DIR/initrd boot=casper netboot=url url=http://${PI_IP}:8080/$ISO ip=dhcp" ;;
-        arch) APPEND_LINE="APPEND initrd=$DIR/initrd archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/$DIR/ ip=dhcp" ;;
-        debian-live) APPEND_LINE="APPEND initrd=$DIR/initrd boot=live fetch=http://${PI_IP}:8080/$ISO components ip=dhcp" ;;
+        casper)
+            APPEND_LINE="APPEND initrd=$DIR/initrd boot=casper netboot=url url=http://${PI_IP}:8080/$ISO_FILE ip=dhcp"
+            ;;
+        arch)
+            APPEND_LINE="APPEND initrd=$DIR/initrd archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/arch/ ip=dhcp"
+            ;;
+        debian-live)
+            APPEND_LINE="APPEND initrd=$DIR/initrd boot=live fetch=http://${PI_IP}:8080/$ISO_FILE components ip=dhcp"
+            ;;
     esac
 
-    cat <<EOF >> /srv/tftp/pxelinux.cfg/default
+    # Insert above 'LABEL local' so Local Disk remains the last option
+    ENTRY="LABEL $DIR\n    MENU LABEL $OS_NAME\n    KERNEL $DIR/vmlinuz\n    $APPEND_LINE"
+    if [ -n "$PASSWORD_LINE" ]; then
+        ENTRY+="\n$PASSWORD_LINE"
+    fi
+    ENTRY+="\n"
 
-LABEL $DIR
-    MENU LABEL $NAME
-    KERNEL $DIR/vmlinuz
-    $APPEND_LINE
-$PASSWORD_LINE
-EOF
-    success "Added $NAME to boot menu"
+    if grep -q "^LABEL local" "$MENU_FILE"; then
+        sed -i "/^LABEL local/i $ENTRY" "$MENU_FILE"
+    else
+        echo -e "\n$ENTRY" >> "$MENU_FILE"
+    fi
+    success "Added '$OS_NAME' to PXE boot menu"
 done
 
-# ==================== DNSMASQ CONFIG ====================
-if [ "$SETUP_STATE" == "NEW" ]; then
-    DNSMASQ_CONF="# PXE Server Configuration\nport=0\nenable-tftp\ntftp-root=/srv/tftp\nlog-dhcp\n\ndhcp-range=${SUBNET},proxy\npxe-service=x86PC, \"Network Boot\", pxelinux\ndhcp-boot=pxelinux.0, ${HOSTNAME}, ${PI_IP}"
-    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
-        DNSMASQ_CONF+="\n\ndhcp-ignore=tag:!known"
-        for mac in "${MAC_LIST[@]}"; do DNSMASQ_CONF+="\ndhcp-host=${mac},set:known"; done
+# ==================== FINAL VERIFICATION ====================
+echo ""
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}  FINAL VERIFICATION${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+PASS=0
+TOTAL=0
+
+check() {
+    TOTAL=$((TOTAL + 1))
+    if eval "$1" &>/dev/null; then
+        success "$2"
+        PASS=$((PASS + 1))
+    else
+        fail "$2"
     fi
-    echo -e "$DNSMASQ_CONF" > /etc/dnsmasq.conf
-    systemctl restart dnsmasq
-    systemctl enable dnsmasq
+}
+
+check "verify_service apache2"                            "Apache2 service is running"
+check "verify_service dnsmasq"                            "Dnsmasq service is running"
+check "verify_port 8080 Apache"                           "Port 8080 is open (Apache)"
+check "verify_file /srv/tftp/pxelinux.0 pxelinux.0"      "Bootloader: pxelinux.0"
+check "verify_file /srv/tftp/vesamenu.c32 vesamenu.c32"   "Bootloader: vesamenu.c32"
+check "verify_file /srv/tftp/pxelinux.cfg/default menu"   "Boot menu config exists"
+
+for idx in "${VALID_SELECTIONS[@]}"; do
+    ISO_FILE="${OS_ISOS[$idx]}"
+    DIR="${OS_DIRS[$idx]}"
+    check "verify_file /var/www/html/$ISO_FILE ISO"       "ISO: $ISO_FILE"
+    check "verify_file /srv/tftp/$DIR/vmlinuz kernel"     "Kernel for $DIR"
+    check "verify_file /srv/tftp/$DIR/initrd initrd"      "Initrd for $DIR"
+done
+
+echo ""
+if [ "$PASS" -eq "$TOTAL" ]; then
+    echo -e "${GREEN}======================================================${NC}"
+    echo -e "${GREEN}   ALL $TOTAL/$TOTAL CHECKS PASSED! SETUP COMPLETE! 🚀${NC}"
+    echo -e "${GREEN}======================================================${NC}"
+else
+    echo -e "${YELLOW}======================================================${NC}"
+    echo -e "${YELLOW}   $PASS/$TOTAL CHECKS PASSED. Review warnings above.${NC}"
+    echo -e "${YELLOW}======================================================${NC}"
 fi
 
-echo -e "\n${GREEN}======================================================${NC}"
-echo -e "${GREEN}   ALL DONE! PXE SERVER UPDATED SUCCESSFULLY 🚀${NC}"
-echo -e "${GREEN}======================================================${NC}"
-echo -e "Served from: http://$PI_IP:8080"
+echo ""
+echo -e "${BOLD}Summary:${NC}"
+echo -e "  Server IP:        ${GREEN}$PI_IP${NC}"
+echo -e "  Architecture:     ${GREEN}$ARCH_LABEL${NC}"
+echo -e "  Web Browser:      ${GREEN}http://$PI_IP:8080${NC}"
+echo -e "  Setup Log:        ${GREEN}$LOG_FILE${NC}"
+echo -e "  Boot Menu:        ${GREEN}/srv/tftp/pxelinux.cfg/default${NC}"
+
+if [ "$SETUP_STATE" == "NEW" ]; then
+    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
+        echo -e "  MAC Whitelisting: ${GREEN}ENABLED (${#MAC_LIST[@]} device(s))${NC}"
+    else
+        echo -e "  MAC Whitelisting: ${YELLOW}DISABLED (any device can boot)${NC}"
+    fi
+
+    if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
+        echo -e "  Menu Password:    ${GREEN}ENABLED${NC}"
+    else
+        echo -e "  Menu Password:    ${YELLOW}DISABLED${NC}"
+    fi
+else
+    echo -e "  Mode:             ${GREEN}APPEND MODE (Existing services preserved)${NC}"
+fi
+
+echo ""
+echo -e "${CYAN}Boot any laptop on your network via PXE and select your OS from the menu! 🎉${NC}"
