@@ -1,9 +1,11 @@
 #!/bin/bash
 # ==============================================================================
-# Universal PXE Boot Server Setup Script (Production Grade)
-# Supports: Linux Mint, Xubuntu, Arch Linux
-# Features: Security (MAC Whitelisting + Menu Password), Full Uninstall,
-#           Per-Command Verification, Architecture Detection, Auto-Recovery
+# Universal PXE Boot Server Setup Script (Production Grade v2.1)
+# Features: Dynamic Online Version Querying from Official Mirrors,
+#           Multi-Distro Variety Selection, State Detection & Append Mode,
+#           Security (MAC Whitelisting + Menu Password), Full Clean Uninstall,
+#           Per-Command Verification, Architecture Detection, Auto-Recovery,
+#           High-Speed 16x Parallel Downloads (aria2c)
 # ==============================================================================
 
 # Colors
@@ -97,12 +99,11 @@ verify_port() {
 # --- Cleanup Trap ---
 cleanup() {
     mountpoint -q /mnt/iso 2>/dev/null && umount /mnt/iso 2>/dev/null
-    mountpoint -q /var/www/html/archiso 2>/dev/null && umount /var/www/html/archiso 2>/dev/null
 }
 trap cleanup EXIT
 
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${GREEN}   Universal PXE Boot Server Setup (Production)${NC}"
+echo -e "${GREEN}   Universal PXE Boot Server Setup (Production v2.1)${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
 # ==================== PRE-FLIGHT CHECKS ====================
@@ -124,7 +125,7 @@ fi
 # Dependency check - verify critical binaries exist on PATH
 echo -n "Checking for required system tools... "
 MISSING_TOOLS=()
-for tool in mount umount tar sed awk grep ss systemctl; do
+for tool in mount umount tar sed awk grep ss systemctl curl; do
     if ! command -v "$tool" &>/dev/null; then
         MISSING_TOOLS+=("$tool")
     fi
@@ -161,25 +162,49 @@ echo -e "${GREEN}[+] Network Subnet:${NC}     $SUBNET"
 echo -e "${CYAN}[i] This script always serves x86_64 boot files to client machines, regardless of server architecture.${NC}"
 echo ""
 
-# ==================== MAIN MENU ====================
+# ==================== STATE DETECTION ====================
+SETUP_STATE="NEW"
+if [ -f /srv/tftp/pxelinux.cfg/default ] && [ -d /var/www/html ] && systemctl is-active --quiet apache2 2>/dev/null; then
+    SETUP_STATE="EXISTING"
+    echo -e "${GREEN}[*] Existing PXE network boot server detected on this machine!${NC}"
+    echo ""
+fi
 
-echo -e "${BOLD}${YELLOW}What would you like to do?${NC}"
-echo "  1) Setup: Linux Mint XFCE      (Recommended - Bulletproof Casper Boot)"
-echo "  2) Setup: Xubuntu 24.04        (Minimal Ubuntu Desktop)"
-echo "  3) Setup: Arch Linux            (Advanced - Terminal Only)"
-echo -e "  ${RED}4) Uninstall: Remove PXE Server & Clean Up${NC}"
-echo ""
+# ==================== MAIN MENU ====================
 while true; do
-    read -p "Enter choice [1-4]: " OS_CHOICE </dev/tty
-    case $OS_CHOICE in
-        1|2|3|4) break ;;
-        *) echo -e "${RED}Invalid. Please enter 1, 2, 3, or 4.${NC}" ;;
-    esac
+    if [ "$SETUP_STATE" == "EXISTING" ]; then
+        echo -e "${BOLD}${YELLOW}What would you like to do?${NC}"
+        echo "  1) Add more Distros to existing PXE Boot Menu (Append Mode)"
+        echo "  2) Wipe & Reinstall PXE Server completely (Fresh Setup)"
+        echo -e "  ${RED}3) Uninstall: Remove PXE Server & Clean Up${NC}"
+        echo "  4) Exit"
+        echo ""
+        read -p "Enter choice [1-4]: " ACTION_CHOICE </dev/tty
+        case $ACTION_CHOICE in
+            1) break ;;
+            2) SETUP_STATE="NEW"; break ;;
+            3) OS_CHOICE="UNINSTALL"; break ;;
+            4) echo "Exiting."; exit 0 ;;
+            *) echo -e "${RED}Invalid choice. Please enter 1, 2, 3, or 4.${NC}" ;;
+        esac
+    else
+        echo -e "${BOLD}${YELLOW}What would you like to do?${NC}"
+        echo "  1) Start Universal PXE Server Setup"
+        echo -e "  ${RED}2) Uninstall: Remove PXE Server & Clean Up${NC}"
+        echo "  3) Exit"
+        echo ""
+        read -p "Enter choice [1-3]: " ACTION_CHOICE </dev/tty
+        case $ACTION_CHOICE in
+            1) break ;;
+            2) OS_CHOICE="UNINSTALL"; break ;;
+            3) echo "Exiting."; exit 0 ;;
+            *) echo -e "${RED}Invalid choice. Please enter 1, 2, or 3.${NC}" ;;
+        esac
+    fi
 done
 
 # ==================== UNINSTALLATION ====================
-
-if [ "$OS_CHOICE" == "4" ]; then
+if [ "$OS_CHOICE" == "UNINSTALL" ]; then
     echo ""
     echo -e "${RED}╔══════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║  WARNING: This will completely remove the PXE       ║${NC}"
@@ -204,9 +229,10 @@ if [ "$OS_CHOICE" == "4" ]; then
     info "Removing TFTP directory..."
     rm -rf /srv/tftp && success "Deleted /srv/tftp" || warn "/srv/tftp did not exist"
 
-    info "Removing downloaded ISOs..."
+    info "Removing downloaded ISOs & mountpoints..."
     rm -f /var/www/html/*.iso && success "Deleted ISOs" || warn "No ISOs found"
-    rm -rf /var/www/html/archiso 2>/dev/null || true
+    rm -rf /var/www/html/archiso /var/www/html/arch* 2>/dev/null || true
+    sed -i '/\/var\/www\/html\/.*loop,ro/d' /etc/fstab 2>/dev/null
 
     info "Removing log file..."
     rm -f "$LOG_FILE" 2>/dev/null || true
@@ -219,100 +245,385 @@ if [ "$OS_CHOICE" == "4" ]; then
     exit 0
 fi
 
+# ==================== DISTRO VARIETIES CATALOG ====================
+DISTRO_OPTIONS=(
+    "Linux Mint (XFCE Edition)"
+    "Linux Mint (Cinnamon Edition)"
+    "Linux Mint (MATE Edition)"
+    "Ubuntu Desktop"
+    "Xubuntu Desktop"
+    "Kubuntu Desktop"
+    "Debian Live (XFCE Edition)"
+    "Debian Live (Cinnamon Edition)"
+    "Debian Live (GNOME Edition)"
+    "Arch Linux"
+)
+
+echo ""
+echo -e "${BOLD}${YELLOW}Operating System & Variety Catalog:${NC}"
+echo -e "${CYAN}[i] Select one or multiple distro varieties (separated by spaces).${NC}"
+for i in "${!DISTRO_OPTIONS[@]}"; do
+    echo "  $((i+1))) ${DISTRO_OPTIONS[$i]}"
+done
+echo ""
+
+while true; do
+    read -p "Enter distro number(s) (e.g. '1' or '1 4'): " -a SELECTED_DISTROS </dev/tty
+    CHOSEN_DISTRO_INDICES=()
+    for sel in "${SELECTED_DISTROS[@]}"; do
+        if [[ "$sel" =~ ^[0-9]+$ ]]; then
+            idx=$((sel-1))
+            if [ -n "${DISTRO_OPTIONS[$idx]}" ]; then
+                if [[ ! " ${CHOSEN_DISTRO_INDICES[*]} " =~ " ${idx} " ]]; then
+                    CHOSEN_DISTRO_INDICES+=("$idx")
+                fi
+            fi
+        fi
+    done
+    if [ ${#CHOSEN_DISTRO_INDICES[@]} -gt 0 ]; then
+        break
+    else
+        warn "No valid choices entered. Please enter numbers from 1 to ${#DISTRO_OPTIONS[@]}."
+    fi
+done
+
+# ==================== DYNAMIC VERSION QUERYING ====================
+
+# Master arrays for resolved download queue
+QUEUE_NAMES=()
+QUEUE_URLS=()
+QUEUE_ISOS=()
+QUEUE_DIRS=()
+QUEUE_TYPES=()
+
+for dist_idx in "${CHOSEN_DISTRO_INDICES[@]}"; do
+    DISTRO_LABEL="${DISTRO_OPTIONS[$dist_idx]}"
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}  Querying Historical Versions for: ${YELLOW}$DISTRO_LABEL${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    info "Contacting official mirror repository indexes..."
+
+    VERSION_LIST=()
+
+    case $dist_idx in
+        0|1|2)
+            # Linux Mint (XFCE, Cinnamon, MATE)
+            RAW_VERS=$(curl -sL --max-time 10 https://mirrors.kernel.org/linuxmint/stable/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | sort -V -r | head -n 16)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("22" "21.3" "21.2" "21.1" "21" "20.3" "20.2" "20.1" "20" "19.3")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        3)
+            # Ubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://releases.ubuntu.com/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04" "16.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        4)
+            # Xubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://cdimage.ubuntu.com/xubuntu/releases/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        5)
+            # Kubuntu Desktop
+            RAW_VERS=$(curl -sL --max-time 10 https://cdimage.ubuntu.com/kubuntu/releases/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | grep -E '^[0-9]{2}\.[0-9]{2}$' | sort -V -r | head -n 12)
+            if [ -z "$RAW_VERS" ]; then
+                warn "Mirror query timed out. Using default version list."
+                VERSION_LIST=("24.04" "22.04" "20.04" "18.04")
+            else
+                readarray -t VERSION_LIST <<< "$RAW_VERS"
+            fi
+            ;;
+        6|7|8)
+            # Debian Live (XFCE, Cinnamon, GNOME)
+            CUR_DEB=$(curl -sL --max-time 8 https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/ | grep -o 'debian-live-[0-9.]*-amd64' | head -n 1 | sed 's/debian-live-//;s/-amd64//')
+            ARCH_DEB=$(curl -sL --max-time 8 https://cdimage.debian.org/cdimage/archive/ | grep -o '[0-9.]*-live' | sed 's/-live//' | sort -V -r | uniq | head -n 10)
+            if [ -n "$CUR_DEB" ]; then
+                VERSION_LIST+=("$CUR_DEB (Current Stable)")
+            fi
+            if [ -n "$ARCH_DEB" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && VERSION_LIST+=("$line")
+                done <<< "$ARCH_DEB"
+            fi
+            if [ ${#VERSION_LIST[@]} -eq 0 ]; then
+                VERSION_LIST=("12.7.0" "12.6.0" "12.5.0" "11.8.0")
+            fi
+            ;;
+        9)
+            # Arch Linux
+            VERSION_LIST=("Latest (Rolling Release)")
+            ARCH_VERS=$(curl -sL --max-time 8 https://archive.archlinux.org/iso/ | grep -o 'href="[0-9][^"]*"' | tr -d 'href="' | tr -d '/' | sort -V -r | head -n 12)
+            if [ -n "$ARCH_VERS" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && VERSION_LIST+=("$line")
+                done <<< "$ARCH_VERS"
+            fi
+            ;;
+    esac
+
+    echo -e "${CYAN}Available historical versions from official mirrors:${NC}"
+    for v_idx in "${!VERSION_LIST[@]}"; do
+        echo "  $((v_idx+1))) ${VERSION_LIST[$v_idx]}"
+    done
+    echo ""
+
+    while true; do
+        read -p "Select version(s) for $DISTRO_LABEL (e.g. '1' or '1 3') [1]: " -a CHOSEN_VERS </dev/tty
+        [ ${#CHOSEN_VERS[@]} -eq 0 ] && CHOSEN_VERS=(1)
+        VALID_VER_INDICES=()
+        for vsel in "${CHOSEN_VERS[@]}"; do
+            if [[ "$vsel" =~ ^[0-9]+$ ]]; then
+                vidx=$((vsel-1))
+                if [ -n "${VERSION_LIST[$vidx]}" ]; then
+                    VALID_VER_INDICES+=("$vidx")
+                fi
+            fi
+        done
+        if [ ${#VALID_VER_INDICES[@]} -gt 0 ]; then
+            break
+        else
+            warn "Please select valid version number(s) from 1 to ${#VERSION_LIST[@]}."
+        fi
+    done
+
+    # Resolve exact URLs and names
+    for vidx in "${VALID_VER_INDICES[@]}"; do
+        RAW_V="${VERSION_LIST[$vidx]}"
+        CLEAN_V=$(echo "$RAW_V" | awk '{print $1}')
+
+        case $dist_idx in
+            0) # Mint XFCE
+                FLAVOR="xfce"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V XFCE")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-xfce-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-xfce.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_xfce")
+                QUEUE_TYPES+=("casper")
+                ;;
+            1) # Mint Cinnamon
+                FLAVOR="cinnamon"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V Cinnamon")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-cinnamon-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-cinnamon.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_cin")
+                QUEUE_TYPES+=("casper")
+                ;;
+            2) # Mint MATE
+                FLAVOR="mate"
+                QUEUE_NAMES+=("Linux Mint $CLEAN_V MATE")
+                QUEUE_URLS+=("https://mirrors.kernel.org/linuxmint/stable/$CLEAN_V/linuxmint-$CLEAN_V-mate-64bit.iso")
+                QUEUE_ISOS+=("linuxmint-$CLEAN_V-mate.iso")
+                QUEUE_DIRS+=("mint_${CLEAN_V//./_}_mate")
+                QUEUE_TYPES+=("casper")
+                ;;
+            3) # Ubuntu Desktop
+                info "Resolving exact point release filename for Ubuntu $CLEAN_V..."
+                UB_FILE=$(curl -sL --max-time 8 "https://releases.ubuntu.com/$CLEAN_V/" | grep -o "ubuntu-[0-9.]*-desktop-amd64.iso" | sort -V | tail -n 1)
+                [ -z "$UB_FILE" ] && UB_FILE="ubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Ubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://releases.ubuntu.com/$CLEAN_V/$UB_FILE")
+                QUEUE_ISOS+=("$UB_FILE")
+                QUEUE_DIRS+=("ubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            4) # Xubuntu Desktop
+                info "Resolving exact point release filename for Xubuntu $CLEAN_V..."
+                XUB_FILE=$(curl -sL --max-time 8 "https://cdimage.ubuntu.com/xubuntu/releases/$CLEAN_V/release/" | grep -o "xubuntu-[0-9.]*-desktop-amd64.iso" | head -n 1)
+                [ -z "$XUB_FILE" ] && XUB_FILE="xubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Xubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://cdimage.ubuntu.com/xubuntu/releases/$CLEAN_V/release/$XUB_FILE")
+                QUEUE_ISOS+=("$XUB_FILE")
+                QUEUE_DIRS+=("xubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            5) # Kubuntu Desktop
+                info "Resolving exact point release filename for Kubuntu $CLEAN_V..."
+                KUB_FILE=$(curl -sL --max-time 8 "https://cdimage.ubuntu.com/kubuntu/releases/$CLEAN_V/release/" | grep -o "kubuntu-[0-9.]*-desktop-amd64.iso" | head -n 1)
+                [ -z "$KUB_FILE" ] && KUB_FILE="kubuntu-$CLEAN_V-desktop-amd64.iso"
+                QUEUE_NAMES+=("Kubuntu $CLEAN_V Desktop")
+                QUEUE_URLS+=("https://cdimage.ubuntu.com/kubuntu/releases/$CLEAN_V/release/$KUB_FILE")
+                QUEUE_ISOS+=("$KUB_FILE")
+                QUEUE_DIRS+=("kubuntu_${CLEAN_V//./_}_desktop")
+                QUEUE_TYPES+=("casper")
+                ;;
+            6) # Debian Live XFCE
+                FLAV="xfce"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live XFCE")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_xfce")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            7) # Debian Live Cinnamon
+                FLAV="cinnamon"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live Cinnamon")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_cin")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            8) # Debian Live GNOME
+                FLAV="gnome"
+                QUEUE_NAMES+=("Debian $CLEAN_V Live GNOME")
+                if [[ "$RAW_V" =~ "Current" ]]; then
+                    QUEUE_URLS+=("https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                else
+                    QUEUE_URLS+=("https://cdimage.debian.org/cdimage/archive/$CLEAN_V-live/amd64/iso-hybrid/debian-live-$CLEAN_V-amd64-$FLAV.iso")
+                fi
+                QUEUE_ISOS+=("debian-live-$CLEAN_V-$FLAV.iso")
+                QUEUE_DIRS+=("debian_${CLEAN_V//./_}_gnome")
+                QUEUE_TYPES+=("debian-live")
+                ;;
+            9) # Arch Linux
+                if [[ "$RAW_V" =~ "Latest" ]]; then
+                    QUEUE_NAMES+=("Arch Linux (Latest Rolling)")
+                    QUEUE_URLS+=("https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso")
+                    QUEUE_ISOS+=("archlinux-latest.iso")
+                    QUEUE_DIRS+=("arch_latest")
+                else
+                    QUEUE_NAMES+=("Arch Linux ($CLEAN_V)")
+                    QUEUE_URLS+=("https://archive.archlinux.org/iso/$CLEAN_V/archlinux-$CLEAN_V-x86_64.iso")
+                    QUEUE_ISOS+=("archlinux-$CLEAN_V.iso")
+                    QUEUE_DIRS+=("arch_${CLEAN_V//./_}")
+                fi
+                QUEUE_TYPES+=("arch")
+                ;;
+        esac
+    done
+done
+
+echo ""
+echo -e "${GREEN}======================================================${NC}"
+echo -e "${BOLD}${GREEN}Operating Systems Queued for Setup:${NC}"
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    echo -e "  - ${CYAN}${QUEUE_NAMES[$q_idx]}${NC} (${QUEUE_ISOS[$q_idx]})"
+done
+echo -e "${GREEN}======================================================${NC}"
+
 # ==================== SECURITY OPTIONS ====================
-
-echo ""
-echo -e "${BOLD}${YELLOW}Security Configuration:${NC}"
-echo -e "${CYAN}[i] These features prevent unauthorized machines from booting off your server.${NC}"
-echo ""
-
-# --- MAC Address Whitelisting ---
 ENABLE_MAC_FILTER="n"
 MAC_LIST=()
-echo -e "${BOLD}MAC Address Whitelisting${NC}"
-echo "  Only laptops whose MAC addresses you whitelist will be allowed to PXE boot."
-echo "  All other machines on the network will be completely ignored."
-read -p "Enable MAC whitelisting? (y/n) [n]: " ENABLE_MAC_FILTER </dev/tty
-ENABLE_MAC_FILTER="${ENABLE_MAC_FILTER:-n}"
-
-if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
-    echo ""
-    echo -e "${CYAN}Enter the MAC addresses of allowed machines (format: aa:bb:cc:dd:ee:ff).${NC}"
-    echo -e "${CYAN}Type 'done' when finished.${NC}"
-    while true; do
-        read -p "  MAC Address: " mac </dev/tty
-        if [[ "$mac" == "done" ]]; then
-            break
-        fi
-        # Validate MAC format
-        if [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
-            MAC_LIST+=("$mac")
-            success "Added: $mac"
-        else
-            warn "Invalid MAC format. Use aa:bb:cc:dd:ee:ff"
-        fi
-    done
-    if [ ${#MAC_LIST[@]} -eq 0 ]; then
-        warn "No MACs entered. Disabling MAC whitelisting."
-        ENABLE_MAC_FILTER="n"
-    else
-        success "${#MAC_LIST[@]} MAC address(es) whitelisted"
-    fi
-fi
-
-# --- Boot Menu Password ---
 ENABLE_MENU_PASSWORD="n"
 MENU_PASSWORD=""
-echo ""
-echo -e "${BOLD}Boot Menu Password Protection${NC}"
-echo "  Even if someone reaches the PXE menu, they must enter a password to boot an OS."
-echo "  (The 'Boot from Local Hard Drive' option will remain unprotected.)"
-read -p "Enable boot menu password? (y/n) [n]: " ENABLE_MENU_PASSWORD </dev/tty
-ENABLE_MENU_PASSWORD="${ENABLE_MENU_PASSWORD:-n}"
 
-if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
-    while true; do
-        read -sp "  Enter boot menu password: " MENU_PASSWORD </dev/tty
+if [ "$SETUP_STATE" == "NEW" ]; then
+    echo ""
+    echo -e "${BOLD}${YELLOW}Security Configuration:${NC}"
+    echo -e "${CYAN}[i] These features prevent unauthorized machines from booting off your server.${NC}"
+    echo ""
+
+    # --- MAC Address Whitelisting ---
+    echo -e "${BOLD}MAC Address Whitelisting${NC}"
+    echo "  Only laptops whose MAC addresses you whitelist will be allowed to PXE boot."
+    echo "  All other machines on the network will be completely ignored."
+    read -p "Enable MAC whitelisting? (y/n) [n]: " ENABLE_MAC_FILTER </dev/tty
+    ENABLE_MAC_FILTER="${ENABLE_MAC_FILTER:-n}"
+
+    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
         echo ""
-        read -sp "  Confirm password: " MENU_PASSWORD_CONFIRM </dev/tty
-        echo ""
-        if [ "$MENU_PASSWORD" == "$MENU_PASSWORD_CONFIRM" ] && [ -n "$MENU_PASSWORD" ]; then
-            success "Boot menu password set"
-            break
+        echo -e "${CYAN}Enter the MAC addresses of allowed machines (format: aa:bb:cc:dd:ee:ff).${NC}"
+        echo -e "${CYAN}Type 'done' when finished.${NC}"
+        while true; do
+            read -p "  MAC Address: " mac </dev/tty
+            if [[ "$mac" == "done" ]]; then
+                break
+            fi
+            if [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+                MAC_LIST+=("$mac")
+                success "Added: $mac"
+            else
+                warn "Invalid MAC format. Use aa:bb:cc:dd:ee:ff"
+            fi
+        done
+        if [ ${#MAC_LIST[@]} -eq 0 ]; then
+            warn "No MACs entered. Disabling MAC whitelisting."
+            ENABLE_MAC_FILTER="n"
         else
-            warn "Passwords did not match or were empty. Try again."
+            success "${#MAC_LIST[@]} MAC address(es) whitelisted"
         fi
-    done
+    fi
+
+    # --- Boot Menu Password ---
+    echo ""
+    echo -e "${BOLD}Boot Menu Password Protection${NC}"
+    echo "  Even if someone reaches the PXE menu, they must enter a password to boot an OS."
+    echo "  (The 'Boot from Local Hard Drive' option will remain unprotected.)"
+    read -p "Enable boot menu password? (y/n) [n]: " ENABLE_MENU_PASSWORD </dev/tty
+    ENABLE_MENU_PASSWORD="${ENABLE_MENU_PASSWORD:-n}"
+
+    if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
+        while true; do
+            read -sp "  Enter boot menu password: " MENU_PASSWORD </dev/tty
+            echo ""
+            read -sp "  Confirm password: " MENU_PASSWORD_CONFIRM </dev/tty
+            echo ""
+            if [ "$MENU_PASSWORD" == "$MENU_PASSWORD_CONFIRM" ] && [ -n "$MENU_PASSWORD" ]; then
+                success "Boot menu password set"
+                break
+            else
+                warn "Passwords did not match or were empty. Try again."
+            fi
+        done
+    fi
+else
+    info "Preserving existing security configuration (dnsmasq & menu settings)."
 fi
 
 # ==================== STEP 1: INSTALL PACKAGES ====================
-
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLUE}  STEP 1/6: Installing Packages${NC}"
+echo -e "${BLUE}  STEP 1/6: Checking / Installing Packages${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-run "Updating package lists" apt update -y
-run "Installing dnsmasq" apt install -y dnsmasq || die "Failed to install dnsmasq"
-run "Installing apache2" apt install -y apache2 || die "Failed to install apache2"
-run "Installing pxelinux" apt install -y pxelinux syslinux-common || die "Failed to install pxelinux"
-run "Installing aria2 download accelerator" apt install -y aria2 || die "Failed to install aria2"
-run "Installing wget" apt install -y wget || die "Failed to install wget"
+if [ "$SETUP_STATE" == "NEW" ]; then
+    run "Updating package lists" apt update -y
+    run "Installing dnsmasq" apt install -y dnsmasq || die "Failed to install dnsmasq"
+    run "Installing apache2" apt install -y apache2 || die "Failed to install apache2"
+    run "Installing pxelinux" apt install -y pxelinux syslinux-common || die "Failed to install pxelinux"
+    run "Installing aria2 download accelerator" apt install -y aria2 || die "Failed to install aria2"
+    run "Installing wget" apt install -y wget || die "Failed to install wget"
+else
+    info "Verifying required packages are installed..."
+    for pkg in dnsmasq apache2 pxelinux syslinux-common aria2 wget; do
+        if ! dpkg -s "$pkg" &>/dev/null; then
+            run "Installing missing package: $pkg" apt install -y "$pkg" || die "Failed to install $pkg"
+        fi
+    done
+fi
 
-# Verify critical binaries now exist
 for bin in dnsmasq apache2 aria2c wget; do
     command -v "$bin" &>/dev/null || die "'$bin' binary not found after installation"
 done
 success "All packages installed and verified on PATH"
 
 # ==================== STEP 2: CONFIGURE APACHE ====================
-
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}  STEP 2/6: Configuring Apache Web Server (Port 8080)${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-# Only change if not already set to 8080
 if grep -q "Listen 80$" /etc/apache2/ports.conf 2>/dev/null; then
     run "Switching Apache from port 80 to 8080" sed -i 's/Listen 80$/Listen 8080/' /etc/apache2/ports.conf
 else
@@ -330,7 +641,6 @@ verify_service "apache2" || die "Apache is not running after restart"
 verify_port 8080 "Apache" || die "Apache is not listening on port 8080"
 
 # ==================== STEP 3: SETUP TFTP BOOTLOADER ====================
-
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}  STEP 3/6: Setting Up TFTP Bootloader (x86_64 files)${NC}"
@@ -339,125 +649,134 @@ echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━�
 run "Creating TFTP directories" mkdir -p /srv/tftp/pxelinux.cfg
 verify_dir /srv/tftp/pxelinux.cfg "TFTP config" || die "Failed to create TFTP directories"
 
-cd /tmp
-rm -f netboot.tar.gz
-run "Downloading Debian amd64 netboot bootloader" wget -q --show-progress https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images/netboot/netboot.tar.gz || die "Failed to download bootloader archive"
-verify_file /tmp/netboot.tar.gz "netboot.tar.gz" || die "Bootloader archive download is missing or empty"
+if [ ! -f /srv/tftp/pxelinux.0 ] || [ ! -f /srv/tftp/vesamenu.c32 ] || [ "$SETUP_STATE" == "NEW" ]; then
+    cd /tmp
+    rm -f netboot.tar.gz
+    run "Downloading Debian amd64 netboot bootloader" wget -q --show-progress https://deb.debian.org/debian/dists/bookworm/main/installer-amd64/current/images/netboot/netboot.tar.gz || die "Failed to download bootloader archive"
+    verify_file /tmp/netboot.tar.gz "netboot.tar.gz" || die "Bootloader archive download is missing or empty"
 
-run "Extracting bootloader archive" tar -xzf netboot.tar.gz
-verify_dir /tmp/debian-installer/amd64 "Extracted bootloader" || die "Bootloader archive did not extract correctly"
+    run "Extracting bootloader archive" tar -xzf netboot.tar.gz
+    verify_dir /tmp/debian-installer/amd64 "Extracted bootloader" || die "Bootloader archive did not extract correctly"
 
-run "Copying pxelinux.0" cp /tmp/debian-installer/amd64/pxelinux.0 /srv/tftp/
-verify_file /srv/tftp/pxelinux.0 "pxelinux.0" || die "pxelinux.0 copy failed"
+    run "Copying pxelinux.0" cp /tmp/debian-installer/amd64/pxelinux.0 /srv/tftp/
+    run "Copying .c32 menu modules" cp /tmp/debian-installer/amd64/boot-screens/*.c32 /srv/tftp/
+    run "Cleaning up temp files" rm -rf /tmp/debian-installer /tmp/netboot.tar.gz
+else
+    success "Bootloader files already present (skipping redownload)"
+fi
 
-run "Copying .c32 menu modules" cp /tmp/debian-installer/amd64/boot-screens/*.c32 /srv/tftp/
-verify_file /srv/tftp/vesamenu.c32 "vesamenu.c32" || die "vesamenu.c32 copy failed"
-verify_file /srv/tftp/ldlinux.c32 "ldlinux.c32" || die "ldlinux.c32 copy failed"
+verify_file /srv/tftp/pxelinux.0 "pxelinux.0" || die "pxelinux.0 missing"
+verify_file /srv/tftp/vesamenu.c32 "vesamenu.c32" || die "vesamenu.c32 missing"
+verify_file /srv/tftp/ldlinux.c32 "ldlinux.c32" || die "ldlinux.c32 missing"
 
-run "Cleaning up temp files" rm -rf /tmp/debian-installer /tmp/netboot.tar.gz
-
-# ==================== STEP 4: DOWNLOAD & EXTRACT OS ====================
-
+# ==================== STEP 4: DOWNLOAD OS ISOs ====================
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLUE}  STEP 4/6: Downloading OS ISO (16x Parallel Speed)${NC}"
+echo -e "${BLUE}  STEP 4/6: Downloading Queued OS ISOs (16x Parallel)${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
 cd /var/www/html
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_URL="${QUEUE_URLS[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
 
-case "$OS_CHOICE" in
-    1)
-        OS_NAME="Linux Mint XFCE"
-        ISO_URL="https://mirrors.kernel.org/linuxmint/stable/21.3/linuxmint-21.3-xfce-64bit.iso"
-        ISO_FILE="mint.iso"
-        DIR="mint"
-        INITRD_NAME="initrd.lz"
-        ;;
-    2)
-        OS_NAME="Xubuntu 24.04"
-        ISO_URL="https://cdimage.ubuntu.com/xubuntu/releases/24.04/release/xubuntu-24.04-desktop-amd64.iso"
-        ISO_FILE="xubuntu.iso"
-        DIR="xubuntu"
-        INITRD_NAME="initrd"
-        ;;
-    3)
-        OS_NAME="Arch Linux (CLI)"
-        ISO_URL="https://geo.mirror.pkgbuild.com/iso/latest/archlinux-x86_64.iso"
-        ISO_FILE="arch.iso"
-        DIR="arch"
-        ;;
-esac
+    echo ""
+    info "Preparing: $OS_NAME ($ISO_FILE)"
 
-info "Selected OS: $OS_NAME"
+    if [ -f "/var/www/html/$ISO_FILE" ]; then
+        EXISTING_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
+        if [ "$EXISTING_SIZE" -gt 100000000 ]; then
+            success "Valid ISO already exists: $ISO_FILE ($(du -h /var/www/html/$ISO_FILE | awk '{print $1}')) - Skipping download"
+            continue
+        else
+            warn "Existing ISO file is corrupted or incomplete (<100MB). Redownloading..."
+            rm -f "/var/www/html/$ISO_FILE"
+        fi
+    fi
 
-rm -f "$ISO_FILE"
-info "Downloading $OS_NAME ISO... (this will take a few minutes)"
-aria2c -x 16 -s 16 "$ISO_URL" -o "$ISO_FILE" || die "ISO download failed. Check internet or mirror at: $ISO_URL"
-verify_file "/var/www/html/$ISO_FILE" "$ISO_FILE" || die "ISO file missing after download"
+    info "Downloading $OS_NAME via aria2c (16 parallel streams)..."
+    aria2c -x 16 -s 16 "$ISO_URL" -o "$ISO_FILE" || die "ISO download failed. Check internet or mirror at: $ISO_URL"
+    verify_file "/var/www/html/$ISO_FILE" "$ISO_FILE" || die "ISO file missing after download"
 
-# Check ISO is not suspiciously tiny (sign of a 404 HTML page saved as .iso)
-ISO_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
-if [ "$ISO_SIZE" -lt 100000000 ]; then
-    die "Downloaded ISO is only $(du -h /var/www/html/$ISO_FILE | awk '{print $1}'). This is likely a corrupt download or a 404 error page. Delete and retry."
-fi
-success "ISO size verified: $(du -h /var/www/html/$ISO_FILE | awk '{print $1}')"
+    ISO_SIZE=$(stat -c%s "/var/www/html/$ISO_FILE" 2>/dev/null || echo "0")
+    if [ "$ISO_SIZE" -lt 100000000 ]; then
+        die "Downloaded ISO is only $(du -h /var/www/html/$ISO_FILE | awk '{print $1}'). This is likely corrupt or a 404 error page. Delete and retry."
+    fi
+    success "ISO size verified: $(du -h /var/www/html/$ISO_FILE | awk '{print $1}')"
+    run "Setting file permissions" chmod 644 /var/www/html/$ISO_FILE
+done
 
-run "Setting file permissions" chmod 644 /var/www/html/$ISO_FILE
-
-# --- Extract Kernel & Initrd ---
+# ==================== STEP 5: EXTRACT KERNEL & INITRAMFS ====================
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}  STEP 5/6: Extracting Kernel & Initramfs${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-run "Creating boot file directory" mkdir -p /srv/tftp/$DIR
-mkdir -p /mnt/iso
-umount /mnt/iso 2>/dev/null || true
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
+    TYPE="${QUEUE_TYPES[$q_idx]}"
 
-run "Mounting ISO" mount -o loop /var/www/html/$ISO_FILE /mnt/iso || die "Failed to mount ISO. File may be corrupted. Delete it and re-run."
+    echo ""
+    info "Extracting boot files for: $OS_NAME"
+    run "Creating TFTP directory /srv/tftp/$DIR" mkdir -p /srv/tftp/$DIR
+    mkdir -p /mnt/iso
+    umount /mnt/iso 2>/dev/null || true
 
-if [ "$OS_CHOICE" == "3" ]; then
-    # Arch Linux
-    mkdir -p /var/www/html/archiso
-    umount /var/www/html/archiso 2>/dev/null || true
-    run "Mounting Arch ISO for HTTP serving" mount -o loop /var/www/html/$ISO_FILE /var/www/html/archiso || die "Failed to mount Arch ISO for HTTP"
-    run "Copying Arch vmlinuz-linux" cp /var/www/html/archiso/arch/boot/x86_64/vmlinuz-linux /srv/tftp/$DIR/ || die "Arch kernel not found in ISO"
-    run "Copying Arch initramfs" cp /var/www/html/archiso/arch/boot/x86_64/initramfs-linux.img /srv/tftp/$DIR/ || die "Arch initramfs not found in ISO"
-    verify_file /srv/tftp/$DIR/vmlinuz-linux "Arch kernel"
-    verify_file /srv/tftp/$DIR/initramfs-linux.img "Arch initramfs"
-else
-    # Mint / Xubuntu (casper-based)
-    run "Copying vmlinuz" cp /mnt/iso/casper/vmlinuz /srv/tftp/$DIR/ || die "vmlinuz not found in ISO casper directory"
-    verify_file /srv/tftp/$DIR/vmlinuz "vmlinuz kernel"
+    run "Mounting ISO" mount -o loop /var/www/html/$ISO_FILE /mnt/iso || die "Failed to mount $ISO_FILE. File may be corrupt."
 
-    # Handle initrd naming differences between distros
-    if [ -f /mnt/iso/casper/initrd.lz ]; then
-        run "Copying initrd.lz" cp /mnt/iso/casper/initrd.lz /srv/tftp/$DIR/
-        INITRD_NAME="initrd.lz"
-    elif [ -f /mnt/iso/casper/initrd ]; then
-        run "Copying initrd" cp /mnt/iso/casper/initrd /srv/tftp/$DIR/
-        INITRD_NAME="initrd"
-    else
-        die "No initrd file found inside ISO's casper/ directory. ISO might be malformed."
+    if [ "$TYPE" == "arch" ]; then
+        mkdir -p /var/www/html/$DIR
+        if ! grep -q "/var/www/html/$ISO_FILE" /etc/fstab 2>/dev/null; then
+            echo "/var/www/html/$ISO_FILE /var/www/html/$DIR udf,iso9660 loop,ro 0 0" >> /etc/fstab
+        fi
+        mountpoint -q /var/www/html/$DIR || mount /var/www/html/$DIR 2>/dev/null || mount -o loop /var/www/html/$ISO_FILE /var/www/html/$DIR
+        run "Copying Arch kernel" cp /mnt/iso/arch/boot/x86_64/vmlinuz-linux /srv/tftp/$DIR/vmlinuz
+        run "Copying Arch initramfs" cp /mnt/iso/arch/boot/x86_64/initramfs-linux.img /srv/tftp/$DIR/initrd
+        verify_file /srv/tftp/$DIR/vmlinuz "Arch kernel (vmlinuz)"
+        verify_file /srv/tftp/$DIR/initrd "Arch initramfs (initrd)"
+    elif [ "$TYPE" == "casper" ]; then
+        run "Copying vmlinuz" cp /mnt/iso/casper/vmlinuz /srv/tftp/$DIR/vmlinuz || die "vmlinuz not found in casper/"
+        verify_file /srv/tftp/$DIR/vmlinuz "vmlinuz kernel"
+
+        if [ -f /mnt/iso/casper/initrd.lz ]; then
+            run "Copying initrd.lz" cp /mnt/iso/casper/initrd.lz /srv/tftp/$DIR/initrd
+        elif [ -f /mnt/iso/casper/initrd ]; then
+            run "Copying initrd" cp /mnt/iso/casper/initrd /srv/tftp/$DIR/initrd
+        else
+            die "No initrd found inside ISO casper/ directory."
+        fi
+        verify_file /srv/tftp/$DIR/initrd "initramfs (initrd)"
+    elif [ "$TYPE" == "debian-live" ]; then
+        KERNEL_SRC=$(ls /mnt/iso/live/vmlinuz* 2>/dev/null | head -1)
+        INITRD_SRC=$(ls /mnt/iso/live/initrd.img* 2>/dev/null | head -1)
+        [ -z "$KERNEL_SRC" ] && die "Debian live kernel not found in live/"
+        [ -z "$INITRD_SRC" ] && die "Debian live initrd not found in live/"
+        run "Copying Debian live kernel" cp "$KERNEL_SRC" /srv/tftp/$DIR/vmlinuz
+        run "Copying Debian live initrd" cp "$INITRD_SRC" /srv/tftp/$DIR/initrd
+        verify_file /srv/tftp/$DIR/vmlinuz "Debian kernel"
+        verify_file /srv/tftp/$DIR/initrd "Debian initramfs"
     fi
-    verify_file /srv/tftp/$DIR/$INITRD_NAME "initramfs ($INITRD_NAME)"
-fi
 
-umount /mnt/iso 2>/dev/null || true
+    umount /mnt/iso 2>/dev/null || true
+    success "Extraction complete for $OS_NAME"
+done
 
-# ==================== STEP 6: CONFIGURE SERVICES ====================
-
+# ==================== STEP 6: CONFIGURE SERVICES & BOOT MENU ====================
 echo ""
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${BLUE}  STEP 6/6: Configuring dnsmasq & Boot Menu${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 
-# --- Build dnsmasq.conf ---
-if [ ! -f /etc/dnsmasq.conf.backup ]; then
-    cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup 2>/dev/null || true
-fi
+# --- Configure dnsmasq (New Setup Only) ---
+if [ "$SETUP_STATE" == "NEW" ]; then
+    if [ ! -f /etc/dnsmasq.conf.backup ]; then
+        cp /etc/dnsmasq.conf /etc/dnsmasq.conf.backup 2>/dev/null || true
+    fi
 
-DNSMASQ_CONF="# === PXE Server Configuration (Auto-Generated) ===
+    DNSMASQ_CONF="# === PXE Server Configuration (Auto-Generated) ===
 port=0
 enable-tftp
 tftp-root=/srv/tftp
@@ -468,60 +787,85 @@ dhcp-range=${SUBNET},proxy
 pxe-service=x86PC, \"Network Boot\", pxelinux
 dhcp-boot=pxelinux.0, ${HOSTNAME}, ${PI_IP}"
 
-# Append MAC whitelist rules if enabled
-if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
-    DNSMASQ_CONF+="\n\n# === MAC Address Whitelisting ===
-# Only the following machines are allowed to PXE boot.
-# All other DHCP/PXE requests are silently ignored.
-dhcp-ignore=tag:!known"
-    for mac in "${MAC_LIST[@]}"; do
-        DNSMASQ_CONF+="\ndhcp-host=${mac},set:known"
-    done
+    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
+        DNSMASQ_CONF+="\n\n# === MAC Address Whitelisting ===\ndhcp-ignore=tag:!known"
+        for mac in "${MAC_LIST[@]}"; do
+            DNSMASQ_CONF+="\ndhcp-host=${mac},set:known"
+        done
+    fi
+
+    echo -e "$DNSMASQ_CONF" > /etc/dnsmasq.conf
+    success "dnsmasq.conf written"
+
+    run "Restarting dnsmasq" systemctl restart dnsmasq || die "dnsmasq failed to start. Run: journalctl -xeu dnsmasq"
+    run "Enabling dnsmasq on boot" systemctl enable dnsmasq
+else
+    success "Preserving existing dnsmasq configuration"
 fi
 
-echo -e "$DNSMASQ_CONF" > /etc/dnsmasq.conf
-success "dnsmasq.conf written"
+# --- Build / Update PXE Boot Menu ---
+MENU_FILE="/srv/tftp/pxelinux.cfg/default"
 
-# --- Build PXE Boot Menu ---
-# Build the OS-specific APPEND line
-case "$OS_CHOICE" in
-    1) APPEND_LINE="APPEND initrd=$DIR/$INITRD_NAME boot=casper netboot=url url=http://${PI_IP}:8080/$ISO_FILE ip=dhcp" ;;
-    2) APPEND_LINE="APPEND initrd=$DIR/$INITRD_NAME boot=casper netboot=url url=http://${PI_IP}:8080/$ISO_FILE ip=dhcp" ;;
-    3) APPEND_LINE="APPEND initrd=$DIR/initramfs-linux.img archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/archiso/ ip=dhcp" ;;
-esac
-
-# Password line (if enabled)
-PASSWORD_LINE=""
-if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
-    PASSWORD_LINE="    MENU PASSWD $MENU_PASSWORD"
-fi
-
-cat <<EOF > /srv/tftp/pxelinux.cfg/default
+# Initialize clean menu if new or missing
+if [ "$SETUP_STATE" == "NEW" ] || [ ! -f "$MENU_FILE" ]; then
+    cat <<EOF > "$MENU_FILE"
 DEFAULT vesamenu.c32
 PROMPT 0
 TIMEOUT 300
 MENU TITLE PXE Network Boot Server ($HOSTNAME)
 
-LABEL os
-    MENU DEFAULT
-    MENU LABEL $OS_NAME
-    KERNEL $DIR/$(ls /srv/tftp/$DIR/ | grep vmlinuz | head -1)
-    $APPEND_LINE
-$PASSWORD_LINE
-
 LABEL local
     MENU LABEL Boot from Local Hard Drive
     LOCALBOOT 0
 EOF
+    success "Initialized fresh boot menu"
+fi
 
-success "Boot menu written to /srv/tftp/pxelinux.cfg/default"
+# Password line (if enabled on new setup)
+PASSWORD_LINE=""
+if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
+    PASSWORD_LINE="    MENU PASSWD $MENU_PASSWORD"
+fi
 
-# --- Start Services ---
-run "Restarting dnsmasq" systemctl restart dnsmasq || die "dnsmasq failed to start. Run: journalctl -xeu dnsmasq"
-run "Enabling dnsmasq on boot" systemctl enable dnsmasq
+# Append / Inject each selected OS into boot menu
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    OS_NAME="${QUEUE_NAMES[$q_idx]}"
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
+    TYPE="${QUEUE_TYPES[$q_idx]}"
+
+    if grep -q "^LABEL $DIR$" "$MENU_FILE" 2>/dev/null; then
+        warn "Boot menu entry for '$OS_NAME' already exists. Skipping duplicate."
+        continue
+    fi
+
+    case "$TYPE" in
+        casper)
+            APPEND_LINE="APPEND initrd=$DIR/initrd boot=casper netboot=url url=http://${PI_IP}:8080/$ISO_FILE ip=dhcp"
+            ;;
+        arch)
+            APPEND_LINE="APPEND initrd=$DIR/initrd archisobasedir=arch archiso_http_srv=http://${PI_IP}:8080/$DIR/ ip=dhcp"
+            ;;
+        debian-live)
+            APPEND_LINE="APPEND initrd=$DIR/initrd boot=live fetch=http://${PI_IP}:8080/$ISO_FILE components ip=dhcp"
+            ;;
+    esac
+
+    ENTRY="LABEL $DIR\n    MENU LABEL $OS_NAME\n    KERNEL $DIR/vmlinuz\n    $APPEND_LINE"
+    if [ -n "$PASSWORD_LINE" ]; then
+        ENTRY+="\n$PASSWORD_LINE"
+    fi
+    ENTRY+="\n"
+
+    if grep -q "^LABEL local" "$MENU_FILE"; then
+        sed -i "/^LABEL local/i $ENTRY" "$MENU_FILE"
+    else
+        echo -e "\n$ENTRY" >> "$MENU_FILE"
+    fi
+    success "Added '$OS_NAME' to PXE boot menu"
+done
 
 # ==================== FINAL VERIFICATION ====================
-
 echo ""
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "${CYAN}  FINAL VERIFICATION${NC}"
@@ -545,8 +889,15 @@ check "verify_service dnsmasq"                            "Dnsmasq service is ru
 check "verify_port 8080 Apache"                           "Port 8080 is open (Apache)"
 check "verify_file /srv/tftp/pxelinux.0 pxelinux.0"      "Bootloader: pxelinux.0"
 check "verify_file /srv/tftp/vesamenu.c32 vesamenu.c32"   "Bootloader: vesamenu.c32"
-check "verify_file /var/www/html/$ISO_FILE ISO"           "ISO file on web server"
-check "verify_file /srv/tftp/pxelinux.cfg/default menu"   "Boot menu config"
+check "verify_file /srv/tftp/pxelinux.cfg/default menu"   "Boot menu config exists"
+
+for q_idx in "${!QUEUE_NAMES[@]}"; do
+    ISO_FILE="${QUEUE_ISOS[$q_idx]}"
+    DIR="${QUEUE_DIRS[$q_idx]}"
+    check "verify_file /var/www/html/$ISO_FILE ISO"       "ISO: $ISO_FILE"
+    check "verify_file /srv/tftp/$DIR/vmlinuz kernel"     "Kernel for $DIR"
+    check "verify_file /srv/tftp/$DIR/initrd initrd"      "Initrd for $DIR"
+done
 
 echo ""
 if [ "$PASS" -eq "$TOTAL" ]; then
@@ -561,23 +912,27 @@ fi
 
 echo ""
 echo -e "${BOLD}Summary:${NC}"
-echo -e "  OS Served:        ${GREEN}$OS_NAME${NC}"
 echo -e "  Server IP:        ${GREEN}$PI_IP${NC}"
 echo -e "  Architecture:     ${GREEN}$ARCH_LABEL${NC}"
-echo -e "  File Browser:     ${GREEN}http://$PI_IP:8080${NC}"
+echo -e "  Web Browser:      ${GREEN}http://$PI_IP:8080${NC}"
 echo -e "  Setup Log:        ${GREEN}$LOG_FILE${NC}"
+echo -e "  Boot Menu:        ${GREEN}/srv/tftp/pxelinux.cfg/default${NC}"
 
-if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
-    echo -e "  MAC Whitelisting: ${GREEN}ENABLED (${#MAC_LIST[@]} device(s))${NC}"
-else
-    echo -e "  MAC Whitelisting: ${YELLOW}DISABLED (any device can boot)${NC}"
-fi
+if [ "$SETUP_STATE" == "NEW" ]; then
+    if [[ "$ENABLE_MAC_FILTER" == "y" || "$ENABLE_MAC_FILTER" == "Y" ]]; then
+        echo -e "  MAC Whitelisting: ${GREEN}ENABLED (${#MAC_LIST[@]} device(s))${NC}"
+    else
+        echo -e "  MAC Whitelisting: ${YELLOW}DISABLED (any device can boot)${NC}"
+    fi
 
-if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
-    echo -e "  Menu Password:    ${GREEN}ENABLED${NC}"
+    if [[ "$ENABLE_MENU_PASSWORD" == "y" || "$ENABLE_MENU_PASSWORD" == "Y" ]]; then
+        echo -e "  Menu Password:    ${GREEN}ENABLED${NC}"
+    else
+        echo -e "  Menu Password:    ${YELLOW}DISABLED${NC}"
+    fi
 else
-    echo -e "  Menu Password:    ${YELLOW}DISABLED${NC}"
+    echo -e "  Mode:             ${GREEN}APPEND MODE (Existing services preserved)${NC}"
 fi
 
 echo ""
-echo -e "${CYAN}Boot any laptop on your network via PXE and enjoy! 🎉${NC}"
+echo -e "${CYAN}Boot any laptop on your network via PXE and select your OS from the menu! 🎉${NC}"
